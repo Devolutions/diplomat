@@ -159,6 +159,14 @@ struct Utf8Template<'a> {
     namespace: &'a str,
 }
 
+/// `DiplomatBool` — the blittable one-byte `bool` stand-in for Result/Option
+/// tags and struct bool fields (the template explains why).
+#[derive(Template)]
+#[template(path = "dotnet/DiplomatBool.cs.jinja", escape = "none")]
+struct DiplomatBoolTemplate<'a> {
+    namespace: &'a str,
+}
+
 /// `DiplomatPinnedMemory` — pins a caller `ReadOnlyMemory` buffer while a
 /// Rust value borrows it, and unpins when the borrowing wrapper is disposed.
 #[derive(Template)]
@@ -522,6 +530,15 @@ pub(crate) fn run<'tcx>(
         }
         .render()
         .expect("Utf8 template render failed"),
+    );
+    add_cs_file(
+        &files,
+        "DiplomatBool.cs".to_string(),
+        DiplomatBoolTemplate {
+            namespace: &namespace,
+        }
+        .render()
+        .expect("DiplomatBool template render failed"),
     );
     // The helper pulls in System.Memory, which the netstandard2.0 floor lacks
     // by default — so only ship it when the run actually pins a slice.
