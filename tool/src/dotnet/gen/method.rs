@@ -951,10 +951,9 @@ pub(super) fn collect_properties(methods: &[MethodInfo<'_>]) -> Vec<PropertyInfo
         }
     }
 
-    properties
-        .into_values()
-        .filter(|property| property.getter.is_some())
-        .collect()
+    // A Rust config object often only has setters, and a write-only C# property
+    // is perfectly legal, so don't require a getter to pair with.
+    properties.into_values().collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

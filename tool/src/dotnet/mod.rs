@@ -675,6 +675,22 @@ mod test {
         (files.take_files(), errors)
     }
 
+    /// Same as [`run_dotnet`], with the `get_`/`set_` property prefixes turned
+    /// on — the configuration real consumers use to get C# properties.
+    fn run_dotnet_with_property_prefixes(
+        tk_stream: proc_macro2::TokenStream,
+    ) -> HashMap<String, String> {
+        let tcx = new_tcx(tk_stream);
+        let mut config = Config::default();
+        config.shared_config.lib_name = Some("somelib".to_string());
+        config.dotnet_config.getters_prefix = Some("get_".to_string());
+        config.dotnet_config.setters_prefix = Some("set_".to_string());
+        let docs_url_gen = DocsUrlGenerator::with_base_urls(None, HashMap::new());
+
+        let (files, _errors) = super::run(&tcx, &config, &docs_url_gen);
+        files.take_files()
+    }
+
     #[test]
     fn native_lib_and_dylib_name_config_aliases_are_supported() {
         let mut native_lib_config = super::DotnetConfig::default();
@@ -2101,6 +2117,113 @@ mod test {
             errors[0].contains("wrapping a borrowed span return"),
             "unexpected diagnostics: {}",
             errors.join("\n")
+        );
+    }
+
+    fn property_test_module(methods: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+        quote! {
+            #[diplomat::bridge]
+            mod ffi {
+                #[diplomat::opaque]
+                pub struct Config;
+
+                impl Config {
+                    #methods
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn getter_and_setter_pair_share_one_property() {
+        let files = run_dotnet_with_property_prefixes(property_test_module(quote! {
+            pub fn get_size(&self) -> usize {
+                unimplemented!()
+            }
+
+            pub fn set_size(&self, size: usize) {
+                unimplemented!()
+            }
+        }));
+
+        let config = files.get("Config.cs").expect("expected Config.cs output");
+        assert!(
+            config.contains("public nuint Size"),
+            "expected a Size property, got:\n{config}"
+        );
+        assert!(
+            config.contains("return GetSize();"),
+            "expected the property to read through GetSize, got:\n{config}"
+        );
+        assert!(
+            config.contains("SetSize(value);"),
+            "expected the property to write through SetSize, got:\n{config}"
+        );
+    }
+
+    #[test]
+    fn setter_without_a_getter_still_renders_a_write_only_property() {
+        let files = run_dotnet_with_property_prefixes(property_test_module(quote! {
+            pub fn set_size(&self, size: usize) {
+                unimplemented!()
+            }
+        }));
+
+        let config = files.get("Config.cs").expect("expected Config.cs output");
+        assert!(
+            config.contains("public nuint Size"),
+            "a set-only Rust config object must still get its property — write-only \
+             properties are legal C#; got:\n{config}"
+        );
+        assert!(
+            config.contains("SetSize(value);"),
+            "expected the property to write through SetSize, got:\n{config}"
+        );
+        assert!(
+            !config.contains("return GetSize();"),
+            "there is no getter to read through, got:\n{config}"
+        );
+    }
+
+    #[test]
+    fn getter_without_a_setter_renders_a_read_only_property() {
+        let files = run_dotnet_with_property_prefixes(property_test_module(quote! {
+            pub fn get_size(&self) -> usize {
+                unimplemented!()
+            }
+        }));
+
+        let config = files.get("Config.cs").expect("expected Config.cs output");
+        assert!(
+            config.contains("public nuint Size"),
+            "expected a Size property, got:\n{config}"
+        );
+        assert!(
+            config.contains("return GetSize();"),
+            "expected the property to read through GetSize, got:\n{config}"
+        );
+        assert!(
+            !config.contains("set\n"),
+            "there is no setter to write through, got:\n{config}"
+        );
+    }
+
+    #[test]
+    fn property_prefixes_off_by_default_emit_plain_methods() {
+        let (files, _errors) = run_dotnet(property_test_module(quote! {
+            pub fn get_size(&self) -> usize {
+                unimplemented!()
+            }
+
+            pub fn set_size(&self, size: usize) {
+                unimplemented!()
+            }
+        }));
+
+        let config = files.get("Config.cs").expect("expected Config.cs output");
+        assert!(
+            !config.contains("public nuint Size"),
+            "without the configured prefixes the methods must stay methods, got:\n{config}"
         );
     }
 }
