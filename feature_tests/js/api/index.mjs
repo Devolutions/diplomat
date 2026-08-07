@@ -86,6 +86,10 @@ export { Unnamespaced } from "./Unnamespaced.mjs"
 
 export { RenamedVectorTest } from "./RenamedVectorTest.mjs"
 
+export { FinalizerOrderDependent } from "./FinalizerOrderDependent.mjs"
+
+export { FinalizerOrderSource } from "./FinalizerOrderSource.mjs"
+
 export { Bar } from "./Bar.mjs"
 
 export { Foo } from "./Foo.mjs"

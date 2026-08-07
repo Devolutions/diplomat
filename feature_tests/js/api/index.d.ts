@@ -88,6 +88,10 @@ export { Unnamespaced } from "./Unnamespaced"
 
 export { RenamedVectorTest } from "./RenamedVectorTest"
 
+export { FinalizerOrderDependent } from "./FinalizerOrderDependent"
+
+export { FinalizerOrderSource } from "./FinalizerOrderSource"
+
 export { Bar } from "./Bar"
 
 export { Foo } from "./Foo"
