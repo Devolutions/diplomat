@@ -273,32 +273,6 @@ struct FuncGen<'a> {
     attrs: &'a crate::ast::Attrs,
 }
 
-/// FFI type + optional conversion (a callable expression) for a payload
-/// embedded in `Result`/`Option`. Mirrors bare top-level return conversion:
-/// if `T` can be returned bare, nested `Option<T>` / `Result<T, E>` use the
-/// same wire type. The caller wraps the conversion in `.map(...)` (ok/Some
-/// arm) or `.map_err(...)` (err arm) so type and value always change together.
-fn payload_tokens(ty: &ast::TypeName) -> (syn::Type, Option<TokenStream>) {
-    match ty {
-        ast::TypeName::Unit => (ty.to_syn(), None),
-        ast::TypeName::Ordering => (ty.ffi_safe_version().to_syn(), Some(quote! { |i| i as i8 })),
-        // Stdlib slices/strs and owned `Box<[u8]>` become Diplomat* slice types.
-        ast::TypeName::StrReference(.., StdlibOrDiplomat::Stdlib)
-        | ast::TypeName::StrSlice(.., StdlibOrDiplomat::Stdlib)
-        | ast::TypeName::PrimitiveSlice(.., StdlibOrDiplomat::Stdlib) => {
-            let syn_ty = ty.ffi_safe_version().to_syn();
-            (syn_ty.clone(), Some(quote! { <#syn_ty>::from }))
-        }
-        _ if !ty.is_ffi_safe() => {
-            // Defensive: any other non-FFI-safe payload gets the same
-            // treatment bare returns already apply via `ffi_safe_version`.
-            let syn_ty = ty.ffi_safe_version().to_syn();
-            (syn_ty.clone(), Some(quote! { <#syn_ty>::from }))
-        }
-        _ => (ty.to_syn(), None),
-    }
-}
-
 fn gen_custom_function(func_info: FuncGen) -> Item {
     let mut all_params = vec![];
 
@@ -355,20 +329,22 @@ fn gen_custom_function(func_info: FuncGen) -> Item {
 
     let (return_tokens, maybe_into) = if let Some(return_type) = func_info.return_type {
         if let ast::TypeName::Result(ok, err, StdlibOrDiplomat::Stdlib) = return_type {
-            // Result payloads that aren't already FFI-safe as bare returns
-            // (stdlib slices/strs, owned `Box<[u8]>`, Ordering, …) must use the
-            // same conversion a top-level return would — otherwise the Ok/Err
-            // arm is a fat pointer / non-C type inside `DiplomatResult`.
-            let (ok_syn, ok_conv) = payload_tokens(ok);
-            let (err_syn, err_conv) = payload_tokens(err);
-            let ok_map = ok_conv.map(|c| quote! { .map(#c) }).unwrap_or_default();
-            let err_map = err_conv
-                .map(|c| quote! { .map_err(#c) })
-                .unwrap_or_default();
-            (
-                quote! { -> diplomat_runtime::DiplomatResult<#ok_syn, #err_syn> },
-                quote! { #ok_map #err_map .into() },
-            )
+            let err = err.to_syn();
+            if ok.is_owned_byte_slice() {
+                // A `Box<[u8]>` Ok payload is a fat pointer with no guaranteed
+                // layout, so it crosses FFI as the repr(C) `DiplomatOwnedSlice<u8>`.
+                let ok = ok.ffi_safe_version().to_syn();
+                (
+                    quote! { -> diplomat_runtime::DiplomatResult<#ok, #err> },
+                    quote! { .map(<#ok>::from).into() },
+                )
+            } else {
+                let ok = ok.to_syn();
+                (
+                    quote! { -> diplomat_runtime::DiplomatResult<#ok, #err> },
+                    quote! { .into() },
+                )
+            }
         } else if let ast::TypeName::StrReference(_, _, StdlibOrDiplomat::Stdlib)
         | ast::TypeName::StrSlice(.., StdlibOrDiplomat::Stdlib)
         | ast::TypeName::PrimitiveSlice(_, _, StdlibOrDiplomat::Stdlib) = return_type
@@ -390,17 +366,29 @@ fn gen_custom_function(func_info: FuncGen) -> Item {
                     };
                     (quote! { -> #return_type_syn }, conversion)
                 }
-                // anything else goes through DiplomatResult — same payload
-                // conversion rule as Result Ok (if bare T is returnable, Option
-                // of T is too).
+                // anything else goes through DiplomatResult
                 _ => {
-                    let (ty_s, conv) = payload_tokens(ty);
-                    let payload_map = conv.map(|c| quote! { .map(#c) }).unwrap_or_default();
+                    // Same fat-pointer rule as Result Ok: owned byte slices must
+                    // cross as `DiplomatOwnedSlice<u8>`, not raw `Box<[u8]>`.
+                    let (ty_s, payload_map) = if ty.is_owned_byte_slice() {
+                        let ty_s = ty.ffi_safe_version().to_syn();
+                        (ty_s.clone(), quote! { .map(<#ty_s>::from) })
+                    } else {
+                        (ty.to_syn(), quote! {})
+                    };
                     let conversion = if *is_std_option == StdlibOrDiplomat::Stdlib {
                         quote! { #payload_map .ok_or(()).into() }
+                    } else if ty.is_owned_byte_slice() {
+                        // DiplomatOption already on the wire: map the Some arm only.
+                        quote! { #payload_map }
                     } else {
-                        // DiplomatOption already on the wire: map Some only when needed.
-                        payload_map
+                        quote! {}
+                    };
+
+                    let conversion = if **ty == ast::TypeName::Ordering {
+                        quote! { .map(|i| i as i8) #conversion }
+                    } else {
+                        conversion
                     };
                     (
                         quote! { -> diplomat_runtime::DiplomatResult<#ty_s, ()> },
