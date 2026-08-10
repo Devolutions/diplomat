@@ -53,7 +53,7 @@
 //!   spans still cannot own pins: their release would be deferred until
 //!   finalization (`Ownership::Borrowed` structurally never produces pins; see
 //!   `gen::method::output_keep_alive_edges`). Wrapping one in `Result`/`Option`
-//!   isn't supported yet.
+//!   is supported the same way as other bare-returnable success payloads.
 //! * An owned `Box<[u8]>` return wraps the `DiplomatOwnedSliceU8` `(ptr, len)`
 //!   struct in `RustVec`, which owns the native allocation and is
 //!   `IDisposable`. It offers the same `WithSpan(...)` / `Clone()` shape as
@@ -2410,12 +2410,10 @@ mod test {
         );
     }
 
-    // Wrapping a borrowed span return in Result/Option hasn't been exercised
-    // end-to-end (the result/option helper structs' bridging was only ever
-    // built for opaque/primitive/struct/enum arms) — reject rather than risk
-    // generating broken code, instead of silently mis-lowering it.
+    // Same rule as bare borrowed returns: Result/Option of a borrowed span is
+    // allowed — wire arm is the slice struct, idiomatic arm is DiplomatBorrowedSpan.
     #[test]
-    fn fallible_borrowed_string_return_is_rejected() {
+    fn fallible_borrowed_string_return_lowers_to_borrowed_span() {
         let tk_stream = quote! {
             #[diplomat::bridge]
             mod ffi {
@@ -2435,12 +2433,58 @@ mod test {
             }
         };
 
-        let (_files, errors) = run_dotnet(tk_stream);
-        assert_eq!(errors.len(), 1);
+        let (files, errors) = run_dotnet(tk_stream);
         assert!(
-            errors[0].contains("wrapping a borrowed span return"),
+            errors.is_empty(),
             "unexpected diagnostics: {}",
             errors.join("\n")
+        );
+        let my_string = files
+            .get("MyString.cs")
+            .expect("expected MyString.cs output");
+        assert!(
+            my_string.contains("public DiplomatBorrowedSpan<byte> TryBorrow()")
+                && my_string.contains("if (!result.IsOk)")
+                && my_string.contains(
+                    "return new DiplomatBorrowedSpan<byte>(result.Ok.Ptr, result.Ok.Len, new object[] { this });"
+                ),
+            "fallible borrowed string should throw on Err and wrap Ok as BorrowedSpan:\n{my_string}"
+        );
+    }
+
+    #[test]
+    fn optional_borrowed_string_return_lowers_to_nullable_borrowed_span() {
+        let tk_stream = quote! {
+            #[diplomat::bridge]
+            mod ffi {
+                use diplomat_runtime::DiplomatStrSlice;
+
+                #[diplomat::opaque]
+                pub struct MyString;
+
+                impl MyString {
+                    pub fn maybe_borrow<'a>(&'a self) -> Option<DiplomatStrSlice<'a>> {
+                        unimplemented!()
+                    }
+                }
+            }
+        };
+
+        let (files, errors) = run_dotnet(tk_stream);
+        assert!(
+            errors.is_empty(),
+            "unexpected diagnostics: {}",
+            errors.join("\n")
+        );
+        let my_string = files
+            .get("MyString.cs")
+            .expect("expected MyString.cs output");
+        assert!(
+            my_string.contains("public DiplomatBorrowedSpan<byte>? MaybeBorrow()")
+                && my_string.contains(
+                    "return result.IsSome ? new DiplomatBorrowedSpan<byte>(result.Value.Ptr, result.Value.Len, new object[] { this }) : (DiplomatBorrowedSpan<byte>?)null;"
+                ),
+            "optional borrowed string should surface as nullable BorrowedSpan:\n{my_string}"
         );
     }
 
