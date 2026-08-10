@@ -67,32 +67,32 @@ public partial class OwnedSliceReturn: IDisposable
         }
     }
 
-        /// <exception cref="ErrorEnumException"></exception>
-        public static RustVec TryMakeBytes(uint len)
+    /// <exception cref="ErrorEnumException"></exception>
+    public static RustVec TryMakeBytes(uint len)
+    {
+        unsafe
         {
-            unsafe
+            var result = Raw.OwnedSliceReturn.TryMakeBytes(len);
+            if (!result.IsOk)
             {
-                var result = Raw.OwnedSliceReturn.TryMakeBytes(len);
-                if (!result.IsOk)
-                {
-                    throw new ErrorEnumException(result.Err);
-                }
-                return new RustVec(result.Ok.Ptr, result.Ok.Len);
+                throw new ErrorEnumException(result.Err);
             }
+            return new RustVec(result.Ok.Ptr, result.Ok.Len);
         }
+    }
 
-        public static RustVec? MaybeMakeBytes(uint len)
+    public static RustVec? MaybeMakeBytes(uint len)
+    {
+        unsafe
         {
-            unsafe
-            {
-                var result = Raw.OwnedSliceReturn.MaybeMakeBytes(len);
-                return result.IsSome ? new RustVec(result.Value.Ptr, result.Value.Len) : null;
-            }
+            var result = Raw.OwnedSliceReturn.MaybeMakeBytes(len);
+            return result.IsSome ? new RustVec(result.Value.Ptr, result.Value.Len) : null;
         }
+    }
 
-        /// <summary>
-        /// Returns the underlying raw handle.
-        /// </summary>
+    /// <summary>
+    /// Returns the underlying raw handle.
+    /// </summary>
     internal unsafe Raw.OwnedSliceReturn* AsFFI()
     {
         return _inner.Ptr;
