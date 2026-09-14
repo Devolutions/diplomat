@@ -42,10 +42,6 @@ struct OpaqueImplTemplate<'ctx> {
     namespace: &'ctx str,
     methods: Vec<MethodInfo<'ctx>>,
     properties: Vec<PropertyInfo<'ctx>>,
-    /// True for an opaque: its instance members check `_inner` before calling
-    /// into Rust, which a struct has no need for. Read by `property.cs.jinja`,
-    /// which both impl templates include.
-    is_opaque: bool,
     /// Per-opaque opt-in for generating a public `IDisposable` surface.
     manually_disposable: bool,
 }
@@ -88,7 +84,6 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
             namespace: self.namespace,
             methods,
             properties,
-            is_opaque: true,
             manually_disposable,
         }
         .render()

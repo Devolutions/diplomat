@@ -87,33 +87,70 @@ methods and types. Static accessors are not supported.
 ## Ownership and memory safety
 
 Every opaque type is backed by a `RustHandle<T>` rather than a bare pointer. A handle
-remembers who owns the underlying memory: an **owned** handle carries the Rust destructor
-and runs it on release; a **borrowed** handle carries none, so releasing it is a no-op
-because Rust still owns (and will free) that memory. This means methods returning `&T` or
-`Option<&T>` are safe to wrap without risking a double-free.
+owns one native pointer and, for an owned value, its destructor. A borrowed handle carries no
+destructor, so cleaning it cannot free Rust-owned memory. This makes `&T`, `&mut T`, and
+`Option<&T>` wrappers non-owning.
 
-Every `RustHandle<T>` is a small reference-counted class: pointer, destructor, edges, and
-refcount live in exactly one place. Construction starts the count at 1 (the owning wrapper).
-`DiplomatRetainDependency()` bumps the count and returns a token the dependent disposes from
-its own cleanup. That is what lets a source wrapper be disposed (or finalized) *before* every
-dependent has let go of it without either use-after-free or an early native destructor call:
-physical native destruction waits until the owner reference **and** every dependent token are
-gone, in whatever order managed lifetimes end. Cleanup always runs the native destructor
-first, then disposes every edge (pins and retain tokens).
+A dependent stores an ordinary managed reference to each source handle. That reference keeps
+the handle reachable for garbage collection without adding native ownership. The generator
+rejects a method whose returned value retains a borrow from an opaque marked
+`#[diplomat::attr(dotnet, manually_disposable)]`. This covers borrowed views, borrowed slices,
+owned lifetime-carrying children, and `Result`/`Option` success and error paths. The diagnostic
+names the method and source and suggests an independent result or removing the attribute.
 
-The reference count is updated with `Interlocked` so a user-thread retain can
-race a finalizer-thread token release on the same handle without lost updates.
-Teardown still runs only on the thread that drives the count to zero.
+Temporary `&self`, `&mut self`, and opaque parameter borrows remain valid when the return does
+not retain them. A manually disposable result may borrow from a non-disposable source. Cleaning
+up a legal dependent releases its borrow bookkeeping and source-handle references; it never
+disposes a source.
+
+Borrow rules are separate from native ownership. Every value that borrows from a shared
+source is a read view, whether Rust returned `&'a T`, `&'a [u8]`, or an owned `Box<T<'a>>`. It
+lets go of the source's borrow when the creating call returns and remembers the source's
+mutation version instead. A later `&mut self` call on the source succeeds and invalidates the
+view; the view's next native call throws `InvalidOperationException`. This stands in for Rust's
+rule that a borrow ends at its last use, which a garbage-collected runtime cannot observe.
+
+A value born from an exclusive borrow (`&'a mut T`, or an owned `Box<T<'a>>` returned from
+`&'a mut self` or an `&'a mut` parameter) is its source's only writer, so it keeps that borrow
+until it is released. Every call on the source throws until then. The generator requires such a
+returned type to be `manually_disposable`, because `Dispose()` is the only deterministic way to
+end the borrow:
+
+```rust
+#[diplomat::opaque_mut]
+pub struct Source(View);
+
+#[diplomat::opaque_mut]
+#[diplomat::attr(dotnet, manually_disposable)]
+pub struct View;
+
+impl Source {
+    pub fn view_mut(&mut self) -> &mut View { &mut self.0 } // `View` must be disposable
+}
+```
+
+A same-thread `Dispose()` or mutation attempt while an operation or `WithSpan` callback exposes
+a native pointer throws instead of freeing that pointer. Callers must synchronize calls and
+disposal across threads; this backend does not promise that race is safe.
+
+An owned return that borrows a managed slice or string parameter keeps that buffer pinned until
+its handle is disposed or finalized. A type that also hands out borrows cannot be
+`manually_disposable`, so its pin lasts until finalization.
+
+Generated opaque types receive an empty Rust `Drop` implementation; see
+[Opaque types: Destructors](../types/opaque.md#destructors) for what that forbids. Binding
+authors must also ensure that field destructors do not access borrowed parent storage. The
+generated outer `Drop` does not prove that field-level precondition.
 
 By default, generated opaques are **finalizer-only**: no public `Dispose()`, cleanup runs
-through a private idempotent path invoked by the finalizer. Add
+through a private idempotent path invoked by the handle finalizer. Add
 `#[diplomat::attr(dotnet, manually_disposable)]` on an opaque type declaration to generate
 `: IDisposable` plus a public `Dispose()` that runs the same cleanup and
-`GC.SuppressFinalize(this)`. `Dispose()` releases this wrapper's ownership reference but
-does not necessarily destroy the native value immediately: existing borrowers keep it
-alive and remain valid. The disposed wrapper itself rejects further use with
-`ObjectDisposedException`. In both modes, native calls are followed by
-`GC.KeepAlive(this)` to prevent finalization while P/Invoke is still using the pointer.
+`GC.SuppressFinalize(this)`. `Dispose()` releases this wrapper's own native resource
+immediately, and throws `InvalidOperationException` if a native operation on the value is still
+in progress on the current thread. Methods that would expose a retained borrow from this source
+are rejected during generation, so `Dispose()` is not a parent-invalidation API. Native
+operations use scoped leases so the handle and its source edges stay alive through P/Invoke.
 
 ## String encoding
 
@@ -134,11 +171,11 @@ representations line up:
 
 A borrowed string or slice return (`&'a str` / `&'a DiplomatStr` / `&'a DiplomatStr16` /
 `&'a [u8]` / `&'a [u32]`) surfaces as `DiplomatBorrowedSpan<T>` — a zero-copy view over
-memory Rust still owns, rooted with the same keep-alive-edge mechanism as a borrowed
-opaque return. It intentionally does not expose a `Span`-returning property (nothing
-would keep the view rooted once the span escaped it); call `WithSpan(...)` for scoped,
-zero-copy, read-only access instead — the same pattern `RustVec` uses for owned returns
-(see below). Producing an independent `T[]` is a separate, explicit step: call `Clone()`.
+memory Rust still owns, rooted with managed source-handle edges. It validates those sources
+before every raw access and implements `IDisposable` to release its edges. It intentionally
+does not expose a `Span`-returning property; call `WithSpan(...)` for scoped, zero-copy,
+read-only access instead. Producing an independent `T[]` is a separate, explicit step: call
+`Clone()`.
 
 An owned `Box<[u8]>` return surfaces as `RustVec` — it owns the native allocation, is
 `IDisposable`, and offers the same `WithSpan(...)` / `Clone()` shape as

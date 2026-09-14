@@ -13,11 +13,9 @@ pub mod ffi {
     pub struct Opaque(String);
 
     #[diplomat::opaque]
-    #[diplomat::attr(dotnet, manually_disposable)]
     pub struct OpaqueMutexedString(Mutex<String>);
 
     #[diplomat::opaque]
-    #[diplomat::attr(dotnet, manually_disposable)]
     pub struct Utf16Wrap(Vec<u16>);
 
     #[derive(Debug, PartialEq, Eq)]

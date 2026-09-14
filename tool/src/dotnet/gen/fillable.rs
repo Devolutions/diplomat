@@ -177,7 +177,7 @@ pub(crate) struct ErrorInfo {
 
 impl ErrorInfo {
     /// `dependencies` are the direct opaque borrow sources this error arm
-    /// retains — threaded through to the inner error opaque's own
+    /// moves into the inner error opaque's own
     /// construction (see `DotnetErrorType::exception_inner_expr`), not a
     /// separate array on the exception class — so the exception class
     /// itself needs no edge plumbing at all. Pins are structurally
@@ -300,7 +300,7 @@ impl DotnetErrorType {
     }
 
     /// Only opaque (`Box<E>`) errors get a managed C# wrapper whose own
-    /// `RustHandle` state can retain a dependency (see
+    /// `RustHandle` state can hold a source edge (see
     /// `Self::exception_inner_expr`); primitive/enum/struct errors marshal by
     /// value, so there's nowhere to hold the retained reference. That's why
     /// this is exactly `is_opaque` — not a coincidence a later edit should

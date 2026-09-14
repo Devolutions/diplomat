@@ -3,9 +3,9 @@
 //! Generates C# bindings that call into the Diplomat-generated C ABI via
 //! P/Invoke (`[DllImport]` externs with the `Cdecl` calling convention).
 //! Every opaque Rust handle maps to a partial class backed by the same
-//! `RustHandle<T>` (`tool/templates/dotnet/RustHandle.cs.jinja`) — a
-//! reference-counted class holding pointer, destructor, edges, and refcount
-//! (see "Reference counting" below).
+//! `RustHandle<T>` (`tool/templates/dotnet/RustHandle.cs.jinja`) — a resource
+//! handle holding one native pointer, its destructor, dependency edges, and
+//! borrow state.
 //! Opaques are finalizer-only by default; `#[diplomat::attr(dotnet, manually_disposable)]`
 //! opts a type into a public `IDisposable` surface.
 //! Slices, `&DiplomatStr` (unvalidated UTF-8) and `&DiplomatStr16` pin
@@ -40,20 +40,18 @@
 //!   .NET Framework floor, the `DiplomatPinnedMemory` helper is emitted only
 //!   when a run actually pins (see `uses_pinned_memory`).
 //! * Borrowed opaque returns (`&T`, `&mut T`, `Option<&T>`) use a non-owning
-//!   `RustHandle<T>.Borrowed(...)` and retain the borrowed-from receiver via
-//!   `DiplomatRetainDependency()` (see below).
+//!   handle and keep a managed source-handle edge. Shared views check the
+//!   source mutation version before each access; exclusive views hold their
+//!   source borrow until cleanup. A retained edge from a
+//!   `manually_disposable` source is rejected during generation.
 //! * Borrowed string/slice returns (`&'a str` / `&'a [u8]` / `&'a [u32]`) wrap
 //!   the same `(ptr, len)` shape as an input slice in `DiplomatBorrowedSpan<T>`,
-//!   rooted with the same retained dependencies a borrowed opaque return
+//!   rooted with the same managed source-handle edges a borrowed opaque return
 //!   uses. It exposes `WithSpan(...)` (scoped, zero-copy, read-only access)
 //!   and `Clone()` (an explicit, independent `T[]`) — never a bare
 //!   `Span`-returning property, since nothing would keep the view's
-//!   dependencies retained once the span escaped it. The sealed span wrapper
-//!   releases its retained opaque dependencies from its finalizer. Borrowed
-//!   spans still cannot own pins: their release would be deferred until
-//!   finalization (`Ownership::Borrowed` structurally never produces pins; see
-//!   `gen::method::output_keep_alive_edges`). Wrapping one in `Result`/`Option`
-//!   isn't supported yet.
+//!   dependencies valid once the span escaped it. Disposal during a span
+//!   callback is rejected before edges are released.
 //! * An owned `Box<[u8]>` return wraps the `DiplomatOwnedSliceU8` `(ptr, len)`
 //!   struct in `RustVec`, which owns the native allocation and is
 //!   `IDisposable`. It offers the same `WithSpan(...)` / `Clone()` shape as
@@ -65,36 +63,17 @@
 //! * Lifetime-carrying owned returns (`Box<T<'a>>`) from opaque wrappers get
 //!   XML lifetime remarks.
 //!
-//! ## Reference counting
+//! ## Resource ownership
 //!
-//! **This is a narrow-scope prototype, not a production-hardened design** —
-//! it intentionally ignores concurrent-call/concurrent-`Dispose` races,
-//! `Result` transactional rollback on partial failure, and other edge cases
-//! called out inline below.
-//!
-//! Every opaque wrapper has exactly one shape: a `RustHandle<Raw.T>? _inner`.
-//! Pins and retain tokens live on that handle, not on a separate wrapper
-//! field. There is no separate "borrow source" lane and no compile-time
-//! classification pass — every opaque unconditionally exposes
-//! `internal unsafe IDisposable DiplomatRetainDependency()`.
-//!
-//! `RustHandle<T>` is always a small reference-counted class: pointer,
-//! destructor, edges, and an `Interlocked`-updated `int _refCount` starting at 1.
-//! Retain uses a CAS loop so a user-thread retain cannot resurrect a handle
-//! the finalizer thread already drove to zero; Decrement uses
-//! `Interlocked.Decrement` so only one thread runs teardown. No `lock`, no
-//! `SafeHandle`.
-//!
-//! Cleanup order in `RustHandle<T>.Decrement()` (once the refcount reaches
-//! zero): run the native destructor/Rust `Drop` first, then dispose every
-//! edge. Pins and retain tokens both implement `IDisposable`. This ensures a
-//! dependent's own Rust destructor always finishes reading whatever it
-//! borrowed before that source can be destroyed, and that a wrapper's own
-//! pinned buffers are never released before its own destructor has read them
-//! — even when that destructor call itself ends up deferred behind a
-//! still-outstanding dependent. See `gen::method::opaque_edges_expr` for how
-//! a return's retained dependencies (`{expr}.DiplomatRetainDependency()`) and
-//! pins are merged into one combined `edges` constructor argument.
+//! Every opaque wrapper has one `RustHandle<Raw.T>? _inner`. The resource handle
+//! owns one native pointer and runs its destructor at most once. A dependent
+//! owns an ordinary managed source-handle edge plus borrow bookkeeping; that
+//! edge keeps the source handle reachable without adding native ownership.
+//! Methods that would retain such an edge from a `manually_disposable` source
+//! fail generation. Application code must synchronize calls and disposal across
+//! threads; this backend does not promise that race to be safe. Finalizer
+//! cleanup still uses atomic state so exactly-once bookkeeping remains valid on
+//! the finalizer thread.
 
 use askama::Template;
 use diplomat_core::hir::{BackendAttrSupport, DocsUrlGenerator, TypeContext};
@@ -176,6 +155,12 @@ struct NativeLibTemplate<'a> {
 #[derive(Template)]
 #[template(path = "dotnet/RustHandle.cs.jinja", escape = "none")]
 struct RustHandleTemplate<'a> {
+    namespace: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "dotnet/BorrowLease.cs.jinja", escape = "none")]
+struct BorrowLeaseTemplate<'a> {
     namespace: &'a str,
 }
 
@@ -547,6 +532,15 @@ pub(crate) fn run<'tcx>(
     );
     add_cs_file(
         &files,
+        "BorrowLease.cs".to_string(),
+        BorrowLeaseTemplate {
+            namespace: &namespace,
+        }
+        .render()
+        .expect("BorrowLease template render failed"),
+    );
+    add_cs_file(
+        &files,
         "RustHandle.cs".to_string(),
         RustHandleTemplate {
             namespace: &namespace,
@@ -708,6 +702,415 @@ mod test {
     }
 
     #[test]
+    fn retained_borrows_from_manually_disposable_sources_are_rejected() {
+        let cases = vec![
+            (
+                "borrowed receiver view",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        impl Source {
+                            pub fn view<'a>(&'a self) -> &'a Self {
+                                unimplemented!()
+                            }
+                        }
+                    }
+                },
+                "source `this` of type `Source`",
+            ),
+            (
+                "borrowed mutable receiver view",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        impl Source {
+                            pub fn view_mut<'a>(&'a mut self) -> &'a mut Self {
+                                unimplemented!()
+                            }
+                        }
+                    }
+                },
+                "source `this` of type `Source`",
+            ),
+            (
+                "borrowed getter from receiver",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        impl Source {
+                            #[diplomat::attr(auto, getter)]
+                            pub fn view<'a>(&'a self) -> &'a Self {
+                                unimplemented!()
+                            }
+                        }
+                    }
+                },
+                "source `this` of type `Source`",
+            ),
+            (
+                "optional named source and owned optional child",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        #[diplomat::opaque]
+                        pub struct Child<'a>(&'a Source);
+
+                        #[diplomat::opaque]
+                        pub struct Factory;
+
+                        impl Factory {
+                            pub fn make<'a>(source: Option<&'a Source>) -> Option<Box<Child<'a>>> {
+                                unimplemented!()
+                            }
+                        }
+                    }
+                },
+                "source `source` of type `Source`",
+            ),
+            (
+                "keyword named source with a lifetime bound",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        #[diplomat::opaque]
+                        pub struct Other;
+
+                        #[diplomat::opaque]
+                        pub struct Child<'a>(&'a Source);
+
+                        #[diplomat::opaque]
+                        pub struct Factory;
+
+                        impl Factory {
+                            pub fn make<'short, 'long: 'short>(
+                                r#type: &'long Source,
+                                other: &'short Other,
+                            ) -> Box<Child<'short>> {
+                                let _ = other;
+                                unimplemented!()
+                            }
+                        }
+                    }
+                },
+                "source `@type` of type `Source`",
+            ),
+            (
+                "borrowed slice from receiver",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        impl Source {
+                            pub fn bytes<'a>(&'a self) -> &'a [u8] {
+                                unimplemented!()
+                            }
+                        }
+                    }
+                },
+                "source `this` of type `Source`",
+            ),
+            (
+                "owned borrowing error",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        #[diplomat::opaque]
+                        pub struct BorrowingError<'a>(&'a Source);
+
+                        #[diplomat::opaque]
+                        pub struct Factory;
+
+                        impl Factory {
+                            pub fn check<'a>(source: &'a Source) -> Result<(), Box<BorrowingError<'a>>> {
+                                unimplemented!()
+                            }
+                        }
+                    }
+                },
+                "source `source` of type `Source`",
+            ),
+            (
+                "owned borrowing success",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        #[diplomat::opaque]
+                        pub struct Child<'a>(&'a Source);
+
+                        #[diplomat::opaque]
+                        pub struct Error;
+
+                        #[diplomat::opaque]
+                        pub struct Factory;
+
+                        impl Factory {
+                            pub fn check<'a>(
+                                source: &'a Source,
+                            ) -> Result<Box<Child<'a>>, Box<Error>> {
+                                unimplemented!()
+                            }
+                        }
+                    }
+                },
+                "source `source` of type `Source`",
+            ),
+        ];
+
+        for (case, tk_stream, expected) in cases {
+            let (_files, errors) = run_dotnet(tk_stream);
+            assert_eq!(errors.len(), 1, "{case}: {errors:?}");
+            assert!(
+                errors[0].contains("retains a borrow")
+                    && errors[0].contains("return an independent value")
+                    && errors[0].contains(expected),
+                "{case}: unexpected diagnostics: {}",
+                errors.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_manually_disposable_sources_are_each_reported() {
+        let tk_stream = quote! {
+            #[diplomat::bridge]
+            mod ffi {
+                #[diplomat::opaque]
+                #[diplomat::attr(dotnet, manually_disposable)]
+                pub struct Source;
+
+                #[diplomat::opaque]
+                #[diplomat::attr(dotnet, manually_disposable)]
+                pub struct Other;
+
+                #[diplomat::opaque]
+                pub struct Child<'a>(&'a Source, &'a Other);
+
+                #[diplomat::opaque]
+                pub struct Factory;
+
+                impl Factory {
+                    pub fn make<'a>(first: &'a Source, second: &'a Other) -> Box<Child<'a>> {
+                        let _ = (first, second);
+                        unimplemented!()
+                    }
+                }
+            }
+        };
+
+        let (_files, errors) = run_dotnet(tk_stream);
+        assert_eq!(errors.len(), 2, "unexpected diagnostics: {errors:?}");
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("source `first` of type `Source`") }));
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("source `second` of type `Other`") }));
+    }
+
+    #[test]
+    fn temporary_and_independent_borrows_from_manually_disposable_sources_are_allowed() {
+        let cases = vec![
+            (
+                "shared receiver",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        impl Source {
+                            pub fn id(&self) -> u64 {
+                                0
+                            }
+                        }
+                    }
+                },
+                "Source.cs",
+                "Id(",
+            ),
+            (
+                "named shared parameter",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        #[diplomat::opaque]
+                        pub struct Factory;
+
+                        impl Factory {
+                            pub fn id(source: &Source) -> u64 {
+                                let _ = source;
+                                0
+                            }
+                        }
+                    }
+                },
+                "Factory.cs",
+                "Id(",
+            ),
+            (
+                "mutable receiver",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        impl Source {
+                            pub fn id_mut(&mut self) -> u64 {
+                                0
+                            }
+                        }
+                    }
+                },
+                "Source.cs",
+                "IdMut(",
+            ),
+            (
+                "temporary mutable parameter",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        #[diplomat::opaque]
+                        pub struct Factory;
+
+                        impl Factory {
+                            pub fn id_mut(source: &mut Source) -> u64 {
+                                let _ = source;
+                                0
+                            }
+                        }
+                    }
+                },
+                "Factory.cs",
+                "IdMut(",
+            ),
+            (
+                "independent owned return",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Source;
+
+                        #[diplomat::opaque]
+                        pub struct Independent;
+
+                        impl Source {
+                            pub fn independent(&self) -> Box<Independent> {
+                                unimplemented!()
+                            }
+                        }
+                    }
+                },
+                "Source.cs",
+                "Independent(",
+            ),
+            (
+                "borrow from independent source",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        pub struct Source;
+
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Child<'a>(&'a Source);
+
+                        impl Source {
+                            pub fn child<'a>(&'a self) -> Box<Child<'a>> {
+                                unimplemented!()
+                            }
+                        }
+                    }
+                },
+                "Source.cs",
+                "Child(",
+            ),
+            (
+                "factory borrow from independent source",
+                quote! {
+                    #[diplomat::bridge]
+                    mod ffi {
+                        #[diplomat::opaque]
+                        #[diplomat::attr(dotnet, manually_disposable)]
+                        pub struct Factory;
+
+                        #[diplomat::opaque]
+                        pub struct Source;
+
+                        #[diplomat::opaque]
+                        pub struct Child<'a>(&'a Source);
+
+                        impl Factory {
+                            pub fn child<'a>(&self, source: &'a Source) -> Box<Child<'a>> {
+                                let _ = source;
+                                unimplemented!()
+                            }
+                        }
+                    }
+                },
+                "Factory.cs",
+                "Child(",
+            ),
+        ];
+
+        for (case, tk_stream, output_file, method) in cases {
+            let (files, errors) = run_dotnet(tk_stream);
+            assert!(errors.is_empty(), "case {case}: {}", errors.join("\n"));
+            let output = files
+                .get(output_file)
+                .unwrap_or_else(|| panic!("case {case}: expected {output_file} output"));
+            assert!(
+                output.contains(method),
+                "case {case}: expected generated method {method} in {output_file}:\n{output}"
+            );
+        }
+    }
+
+    #[test]
     fn native_lib_and_dylib_name_config_aliases_are_supported() {
         let mut native_lib_config = super::DotnetConfig::default();
         native_lib_config.set(
@@ -810,12 +1213,12 @@ mod test {
 
         let foo = files.get("Foo.cs").expect("expected Foo.cs output");
         assert!(
-            foo.contains(".Borrowed("),
-            "borrowed return should build the wrapper via the non-owning Borrowed factory:\n{foo}"
+            foo.contains("WrapperKind.SharedView"),
+            "borrowed return should build a shared non-owning view:\n{foo}"
         );
         assert!(
-            foo.contains("RustHandle<Raw.Foo>") && foo.contains("inner.Release()"),
-            "a borrow-target wrapper should carry ownership in the handle and free via Release:\n{foo}"
+            foo.contains("RustHandle<Raw.Foo>") && foo.contains("inner.ReleaseWrapper()"),
+            "a wrapper should release its own handle without owning the borrowed pointer:\n{foo}"
         );
         assert!(
             !foo.contains("_owned"),
@@ -823,12 +1226,10 @@ mod test {
         );
     }
 
-    // A borrowed opaque return retains the receiver via
-    // `DiplomatRetainDependency()` instead of just GC-rooting it bare, so the
-    // *native* source allocation stays alive — not just the managed wrapper —
-    // until the returned view's own cleanup releases it.
+    // A borrowed opaque return moves its scoped receiver lease into a managed
+    // source-handle edge without adding native ownership.
     #[test]
-    fn borrowed_opaque_return_retains_receiver_as_rc_dependency() {
+    fn borrowed_opaque_return_moves_receiver_lease_into_view() {
         let tk_stream = quote! {
             #[diplomat::bridge]
             mod ffi {
@@ -852,24 +1253,21 @@ mod test {
 
         let foo = files.get("Foo.cs").expect("expected Foo.cs output");
         assert!(
-            foo.contains("new Foo(RustHandle<Raw.Foo>.Borrowed(result, new object[] { this.DiplomatRetainDependency() }))"),
-            "a borrowed opaque return should retain the receiver directly, at \
-             construction time:\n{foo}"
+            foo.contains("new Foo(result, WrapperKind.SharedView")
+                && foo.contains("LifetimeEdge.Move(ref selfLease)"),
+            "a borrowed opaque return should move its receiver lease into the view:\n{foo}"
         );
         assert!(
-            foo.contains("internal unsafe IDisposable DiplomatRetainDependency()"),
-            "every opaque wrapper should expose DiplomatRetainDependency() so \
-             dependents elsewhere can retain its native resource state:\n{foo}"
+            !foo.contains("DiplomatRetainDependency") && !foo.contains("_refCount"),
+            "the generated view must not use the removed native retain API:\n{foo}"
         );
     }
 
-    // An owned-but-borrowing return (a value with its own Rust destructor
-    // that also borrows a receiver/parameter's lifetime) must retain that
-    // source via `DiplomatRetainDependency()` at construction time. Every
-    // opaque — Owner and Dependent alike — uses the same uniform
-    // `RustHandle<T>` + combined `_edges` array shape.
+    // An owned-but-borrowing return moves its source lease into the owned
+    // handle. The source handle remains reachable without adding native
+    // ownership to the returned value.
     #[test]
-    fn owned_borrowing_return_retains_receiver_as_rc_dependency() {
+    fn owned_borrowing_return_moves_receiver_lease_into_handle() {
         let tk_stream = quote! {
             #[diplomat::bridge]
             mod ffi {
@@ -896,43 +1294,214 @@ mod test {
 
         let owner = files.get("Owner.cs").expect("expected Owner.cs output");
         assert!(
-            owner.contains(
-                "new Dependent(result, new object[] { this.DiplomatRetainDependency() })"
-            ),
-            "an owned-borrowing return should retain the receiver directly, \
-             right at the constructor call:\n{owner}"
+            owner.contains("new Dependent(result, LifetimeEdge.Move(ref selfLease))"),
+            "an owned-borrowing return should move the receiver lease at construction:\n{owner}"
         );
 
         let dependent = files
             .get("Dependent.cs")
             .expect("expected Dependent.cs output");
         assert!(
-            dependent.contains("internal unsafe Dependent(Raw.Dependent* handle, object[] edges)"),
-            "the owned-borrowing wrapper should accept its retained \
-             dependencies through the same combined `edges` constructor \
-             parameter every opaque uses:\n{dependent}"
+            dependent.contains(
+                "internal unsafe Dependent(Raw.Dependent* handle, params ILifetimeEdge?[] edges)"
+            ),
+            "the owned-borrowing wrapper should accept managed lifetime edges:\n{dependent}"
         );
         assert!(
             dependent.contains("_inner = RustHandle<Raw.Dependent>.Owned(handle, _destroy);")
                 && dependent.contains("Owned(handle, _destroy, edges)"),
-            "Dependent threads edges into RustHandle.Owned — released only \
-             after its own Rust destructor already ran:\n{dependent}"
+            "Dependent threads edges into its single native owner:\n{dependent}"
         );
     }
 
-    // Regression test for the pin-lifetime bug: a wrapper's own pinned input
-    // buffers must only be unpinned once the SHARED refcount reaches zero —
-    // i.e. strictly after this value's own Rust destructor actually runs,
-    // even when that destructor call is deferred behind a still-outstanding
-    // RC dependent rather than invoked by this wrapper's own owner-release
-    // call. Before the fix, an opaque's `Cleanup()` unpinned its own
-    // `_edges` unconditionally right after calling `_inner.Release()`,
-    // regardless of whether that specific call was the one that actually
-    // ran the destructor — so a deferred destructor (because some other
-    // dependent still held a reference) could read an already-unpinned,
-    // possibly-moved buffer.
+    // The shared runtime owns one pointer and keeps active-operation guards
+    // separate from managed source edges.
     #[test]
-    fn generated_rc_runtime_unpins_only_after_its_own_destructor_runs() {
+    fn owned_child_from_shared_borrow_is_a_versioned_read_view() {
+        let (files, errors) = run_dotnet(quote! {
+            #[diplomat::bridge]
+            mod ffi {
+                #[diplomat::opaque_mut]
+                pub struct Owner;
+
+                #[diplomat::opaque]
+                pub struct Dependent<'a>(&'a Owner);
+
+                impl Owner {
+                    pub fn make_dependent<'a>(&'a self) -> Box<Dependent<'a>> {
+                        unimplemented!()
+                    }
+
+                    pub fn touch(&mut self) {}
+                }
+            }
+        });
+        assert!(
+            errors.is_empty(),
+            "an owned child of a shared borrow needs no attribute: {}",
+            errors.join("\n")
+        );
+
+        let rust_handle = files
+            .get("RustHandle.cs")
+            .expect("expected RustHandle.cs output");
+        assert!(
+            rust_handle.contains("kind == WrapperKind.Owned && lease.Kind == BorrowKind.Shared"),
+            "an owned wrapper must turn a shared source lease into a versioned edge:\n{rust_handle}"
+        );
+    }
+
+    #[test]
+    fn exclusive_view_return_requires_manually_disposable() {
+        let (_, errors) = run_dotnet(quote! {
+            #[diplomat::bridge]
+            mod ffi {
+                #[diplomat::opaque_mut]
+                pub struct Source(View);
+
+                #[diplomat::opaque_mut]
+                pub struct View;
+
+                impl Source {
+                    pub fn view_mut<'a>(&'a mut self) -> &'a mut View {
+                        unimplemented!()
+                    }
+                }
+            }
+        });
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("method `ViewMut`")
+                    && e.contains("is `View`")
+                    && e.contains("exclusive borrow of `this` of type `Source`")
+                    && e.contains("manually_disposable")
+            }),
+            "an `&mut` view must be manually_disposable: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn manually_disposable_exclusive_view_return_is_accepted() {
+        let (files, errors) = run_dotnet(quote! {
+            #[diplomat::bridge]
+            mod ffi {
+                #[diplomat::opaque_mut]
+                pub struct Source(View);
+
+                #[diplomat::opaque_mut]
+                #[diplomat::attr(dotnet, manually_disposable)]
+                pub struct View;
+
+                impl Source {
+                    pub fn view_mut<'a>(&'a mut self) -> &'a mut View {
+                        unimplemented!()
+                    }
+                }
+            }
+        });
+        assert!(
+            errors.is_empty(),
+            "unexpected diagnostics: {}",
+            errors.join("\n")
+        );
+        let source = files.get("Source.cs").expect("expected Source.cs output");
+        assert!(
+            source.contains("WrapperKind.ExclusiveView"),
+            "the `&mut` view keeps its exclusive borrow until disposed:\n{source}"
+        );
+    }
+
+    #[test]
+    fn owned_child_from_exclusive_receiver_requires_manually_disposable() {
+        let (_, errors) = run_dotnet(quote! {
+            #[diplomat::bridge]
+            mod ffi {
+                #[diplomat::opaque_mut]
+                pub struct Source;
+
+                #[diplomat::opaque]
+                pub struct Writer<'a>(&'a mut Source);
+
+                impl Source {
+                    pub fn writer<'a>(&'a mut self) -> Box<Writer<'a>> {
+                        unimplemented!()
+                    }
+                }
+            }
+        });
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("method `Writer`")
+                    && e.contains("is `Writer`")
+                    && e.contains("exclusive borrow of `this` of type `Source`")
+            }),
+            "an owned child of `&mut self` must be manually_disposable: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn owned_child_from_exclusive_parameter_requires_manually_disposable() {
+        let (_, errors) = run_dotnet(quote! {
+            #[diplomat::bridge]
+            mod ffi {
+                #[diplomat::opaque_mut]
+                pub struct Source;
+
+                #[diplomat::opaque]
+                pub struct Writer<'a>(&'a mut Source);
+
+                #[diplomat::opaque]
+                pub struct Factory;
+
+                impl Factory {
+                    pub fn attach<'a>(target: &'a mut Source) -> Box<Writer<'a>> {
+                        unimplemented!()
+                    }
+                }
+            }
+        });
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("method `Attach`")
+                    && e.contains("exclusive borrow of `target` of type `Source`")
+            }),
+            "an owned child of an `&mut` parameter must be manually_disposable: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn manually_disposable_owned_child_from_exclusive_receiver_is_accepted() {
+        let (files, errors) = run_dotnet(quote! {
+            #[diplomat::bridge]
+            mod ffi {
+                #[diplomat::opaque_mut]
+                pub struct Source;
+
+                #[diplomat::opaque]
+                #[diplomat::attr(dotnet, manually_disposable)]
+                pub struct Writer<'a>(&'a mut Source);
+
+                impl Source {
+                    pub fn writer<'a>(&'a mut self) -> Box<Writer<'a>> {
+                        unimplemented!()
+                    }
+                }
+            }
+        });
+        assert!(
+            errors.is_empty(),
+            "unexpected diagnostics: {}",
+            errors.join("\n")
+        );
+        let source = files.get("Source.cs").expect("expected Source.cs output");
+        assert!(
+            source.contains("new Writer(result, LifetimeEdge.Move(ref selfLease))"),
+            "the exclusive child takes over the receiver lease:\n{source}"
+        );
+    }
+
+    #[test]
+    fn generated_runtime_has_one_owner_and_no_native_retain_counter() {
         let tk_stream = quote! {
             #[diplomat::bridge]
             mod ffi {
@@ -961,37 +1530,18 @@ mod test {
             .get("RustHandle.cs")
             .expect("expected RustHandle.cs output");
 
-        // The combined edges array must be a constructor parameter of
-        // `RustHandle<T>` itself (not a separately-released field on
-        // the generated wrapper), so both a wrapper's own pins and any
-        // retained dependency tokens live behind the exact same
-        // refcount-reaching-zero gate as the Rust destructor.
         assert!(
-            rust_handle.contains(
-                "private RustHandle(T* ptr, RustDestructor<T>? destructor, object[] edges)"
-            ),
-            "edges must be threaded into RustHandle's own constructor:\n{rust_handle}"
+            rust_handle.contains("private IntPtr _ptr")
+                && rust_handle.contains("private LifetimeEdges _edges"),
+            "the runtime should have one pointer owner and explicit source edges:\n{rust_handle}"
         );
-
-        // Inside `Decrement()`, the destructor call must textually precede
-        // the edges-disposal loop, and both must be reachable only from the
-        // refcount-reaches-zero branch — never unconditionally on every
-        // release call.
-        let refcount_zero_branch = rust_handle
-            .find("if (Interlocked.Decrement(ref _refCount) != 0)")
-            .expect("Decrement() should early-return unless the refcount just hit zero");
-        let destructor_at = rust_handle
-            .find("_destructor(ptr);")
-            .expect("Decrement() should still call the destructor once refcount hits zero");
-        let unpin_at = rust_handle
-            .find("(edge as IDisposable)?.Dispose();")
-            .expect("Decrement() should dispose this wrapper's own edges (pins and dependencies)");
         assert!(
-            refcount_zero_branch < destructor_at && destructor_at < unpin_at,
-            "the destructor must run, in order, strictly between the \
-             refcount-zero check and the edges-disposal sweep — both gated \
-             on the SAME zero-refcount branch, not on every Release() call:\n{rust_handle}"
+            rust_handle.contains("private int _activeOperations")
+                && rust_handle
+                    .contains("Cannot dispose a native value while an operation is active"),
+            "active operation guards must reject same-thread reentrant disposal:\n{rust_handle}"
         );
+        assert!(!rust_handle.contains("SafeHandle") && !rust_handle.contains("_refCount"));
 
         // No opaque wrapper should do its own separate pin-disposal — that
         // responsibility lives entirely in RustHandle.
@@ -1045,7 +1595,7 @@ mod test {
             "borrowed &DiplomatStr param should surface as ReadOnlyMemory<byte>:\n{foo}"
         );
         assert!(
-            foo.contains("new Foo(result, new object[] { xPin })"),
+            foo.contains("new Foo(result, xPin)"),
             "infallible owned return should root the pin holder as an edge:\n{foo}"
         );
         assert!(
@@ -1187,7 +1737,7 @@ mod test {
             "raw call should pass the pinned pointer:\n{list}"
         );
         assert!(
-            list.contains("new Parsed(result.Ok, new object[] { dataPin })"),
+            list.contains("new Parsed(result.Ok, dataPin)"),
             "the returned wrapper should root the pin holder as an edge:\n{list}"
         );
         assert!(
@@ -1203,10 +1753,8 @@ mod test {
         );
     }
 
-    // Rust's Drop may still read the buffer, so the unpin lives behind the
-    // RustHandle's own destruction seam, gated on the refcount
-    // reaching zero — never in a holder finalizer, and never unconditionally
-    // on this wrapper's own Cleanup().
+    // The returned handle owns the pin edge and releases it after its native
+    // destructor, while source-handle edges remain ordinary managed references.
     #[test]
     fn owned_return_borrowing_byte_slice_unpins_on_dispose() {
         let tk_stream = quote! {
@@ -1232,7 +1780,7 @@ mod test {
 
         let foo = files.get("Foo.cs").expect("expected Foo.cs output");
         assert!(
-            foo.contains("new Foo(result, new object[] { dataPin })"),
+            foo.contains("new Foo(result, dataPin)"),
             "infallible owned return should root the pin holder as an edge:\n{foo}"
         );
         assert!(
@@ -1330,7 +1878,7 @@ mod test {
             "the catch should dispose both pins independently:\n{pair}"
         );
         assert!(
-            pair.contains("new Pair(result, new object[] { aPin, bPin })"),
+            pair.contains("new Pair(result, aPin, bPin)"),
             "both distinct pin locals should be rooted on the returned wrapper:\n{pair}"
         );
     }
@@ -1600,7 +2148,7 @@ mod test {
             "borrowed &DiplomatStr16 should be pinned via DiplomatPinnedMemory:\n{foo}"
         );
         assert!(
-            foo.contains("new Foo(result, new object[] { xPin })"),
+            foo.contains("new Foo(result, xPin)"),
             "infallible owned return should root the pin holder as an edge:\n{foo}"
         );
     }
@@ -1826,7 +2374,7 @@ mod test {
         );
         assert!(
             owner.contains(
-                "throw new BorrowingErrorException(new BorrowingError(result.Err, new object[] { this.DiplomatRetainDependency() }));"
+                "throw new BorrowingErrorException(new BorrowingError(result.Err, LifetimeEdge.Move(ref selfLease)));"
             ),
             "error path should retain the receiver directly, at the inner error's construction:\n{owner}"
         );
@@ -1871,7 +2419,7 @@ mod test {
         let owner = files.get("Owner.cs").expect("expected Owner.cs output");
         assert!(
             owner.contains(
-                "throw new BorrowingErrorException(new BorrowingError(result.Err, new object[] { this.DiplomatRetainDependency() }));"
+                "throw new BorrowingErrorException(new BorrowingError(result.Err, LifetimeEdge.Move(ref selfLease)));"
             ),
             "error path should retain the receiver directly, at the inner error's construction:\n{owner}"
         );
@@ -2208,7 +2756,7 @@ mod test {
         );
         assert!(
             my_string.contains(
-                "new DiplomatBorrowedSpan<byte>(result.Ptr, result.Len, new object[] { this.DiplomatRetainDependency() })"
+                "new DiplomatBorrowedSpan<byte>(result.Ptr, result.Len, new ILifetimeEdge?[] { LifetimeEdge.Move(ref selfLease) })"
             ),
             "the returned view should retain `this` as an RC dependency:\n{my_string}"
         );
@@ -2230,12 +2778,12 @@ mod test {
             "an independent copy should be a separate, explicitly-named operation:\n{span}"
         );
         assert!(
-            !span.contains("void Dispose()"),
-            "the view never owns the memory, so it shouldn't be IDisposable:\n{span}"
+            span.contains("public sealed unsafe class DiplomatBorrowedSpan<T> : IDisposable"),
+            "the view should release its managed source edges explicitly:\n{span}"
         );
         assert!(
-            span.contains("~DiplomatBorrowedSpan()"),
-            "the view finalizer must release retained source dependencies:\n{span}"
+            span.contains("LifetimeEdges.ReleaseNoThrow(edges)"),
+            "the view cleanup must release source edges from both Dispose and finalization:\n{span}"
         );
     }
 
@@ -2271,7 +2819,7 @@ mod test {
         );
         assert!(
             buffer.contains(
-                "new DiplomatBorrowedSpan<uint>(result.Ptr, result.Len, new object[] { this.DiplomatRetainDependency() })"
+                "new DiplomatBorrowedSpan<uint>(result.Ptr, result.Len, new ILifetimeEdge?[] { LifetimeEdge.Move(ref selfLease) })"
             ),
             "the returned view should retain `this` as an RC dependency:\n{buffer}"
         );
@@ -2457,12 +3005,8 @@ mod test {
             "default opaque should not expose public Dispose:\n{plain}"
         );
         assert!(
-            plain.contains("private void Cleanup()")
-                && plain.contains("~Plain()")
-                && plain.contains("try")
-                && plain.contains("Cleanup();")
-                && plain.contains("catch"),
-            "default opaque should use finalizer fallback through Cleanup:\n{plain}"
+            plain.contains("private void Cleanup()") && !plain.contains("~Plain()"),
+            "default opaque leaves finalization to its RustHandle; the wrapper has no finalizer:\n{plain}"
         );
     }
 
@@ -2517,8 +3061,8 @@ mod test {
         );
         assert!(
             finalizer_only.contains("private void Cleanup()")
-                && finalizer_only.contains("~FinalizerOnly()"),
-            "unmarked opaque still needs private cleanup + finalizer:\n{finalizer_only}"
+                && !finalizer_only.contains("~FinalizerOnly()"),
+            "unmarked opaque keeps private cleanup and leaves finalization to its RustHandle:\n{finalizer_only}"
         );
 
         let manual = files.get("Manual.cs").expect("expected Manual.cs output");
@@ -2533,8 +3077,8 @@ mod test {
             "`manually_disposable` must expose Dispose() that suppresses finalization:\n{manual}"
         );
         assert!(
-            manual.contains("~Manual()") && manual.contains("try") && manual.contains("catch"),
-            "opted-in opaque should still keep finalizer fallback:\n{manual}"
+            !manual.contains("~Manual()"),
+            "opted-in opaque leaves finalization to its RustHandle:\n{manual}"
         );
         assert!(
             manual.contains("public void Ping()")
