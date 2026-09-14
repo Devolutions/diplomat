@@ -139,5 +139,13 @@ Rust commands used `CARGO_TARGET_DIR=D:\diplomat-dotnet-no-rc\target`.
 | `dotnet build feature_tests/dotnet/Somelib.FeatureTests.csproj -c Debug --no-restore -f net48` | 0; absent native DLL warning only |
 | `git diff --check` | 0 |
 
-No test runner was invoked: `cargo test`, `dotnet test`, and the trybuild cases remain NOT RUN,
-so the trybuild `.stderr` baselines still do not exist.
+### Test run (2026-09-14, after the review fixes)
+
+| Command | Result |
+| --- | --- |
+| `TRYBUILD=overwrite cargo test -p diplomat --test opaque_drop` | 1 passed; wrote `macro/tests/ui/*.stderr` |
+| `cargo test -p diplomat` | 16 + 1 passed |
+| `cargo test -p diplomat-tool` | 105 passed after fixing ten stale generator tests (`AsFFI()` call shape, `Handle` getter counted as a property getter, explicit edge array in the error path, `&mut` fixtures missing `opaque_mut`, an `r#type` parameter HIR cannot lower) |
+| `cargo build -p diplomat-feature-tests` | 0 |
+| `dotnet test feature_tests/dotnet/Somelib.FeatureTests.csproj -c Debug --no-restore -f net8.0` | 120 passed |
+| `dotnet test feature_tests/dotnet/Somelib.FeatureTests.csproj -c Debug --no-restore -f net48` | 120 passed |

@@ -686,6 +686,12 @@ mod test {
         }
     }
 
+    // Property accessors and the internal `Handle` getter share one indentation,
+    // so count getters without the handle's.
+    fn property_getter_count(config: &str) -> usize {
+        config.matches("        get").count() - config.matches("> Handle").count()
+    }
+
     fn run_dotnet(tk_stream: proc_macro2::TokenStream) -> (HashMap<String, String>, Vec<String>) {
         let tcx = new_tcx(tk_stream);
         let mut config = Config::default();
@@ -727,7 +733,7 @@ mod test {
                 quote! {
                     #[diplomat::bridge]
                     mod ffi {
-                        #[diplomat::opaque]
+                        #[diplomat::opaque_mut]
                         #[diplomat::attr(dotnet, manually_disposable)]
                         pub struct Source;
 
@@ -803,7 +809,7 @@ mod test {
 
                         impl Factory {
                             pub fn make<'short, 'long: 'short>(
-                                r#type: &'long Source,
+                                string: &'long Source,
                                 other: &'short Other,
                             ) -> Box<Child<'short>> {
                                 let _ = other;
@@ -812,7 +818,7 @@ mod test {
                         }
                     }
                 },
-                "source `@type` of type `Source`",
+                "source `@string` of type `Source`",
             ),
             (
                 "borrowed slice from receiver",
@@ -988,7 +994,7 @@ mod test {
                 quote! {
                     #[diplomat::bridge]
                     mod ffi {
-                        #[diplomat::opaque]
+                        #[diplomat::opaque_mut]
                         #[diplomat::attr(dotnet, manually_disposable)]
                         pub struct Source;
 
@@ -1007,7 +1013,7 @@ mod test {
                 quote! {
                     #[diplomat::bridge]
                     mod ffi {
-                        #[diplomat::opaque]
+                        #[diplomat::opaque_mut]
                         #[diplomat::attr(dotnet, manually_disposable)]
                         pub struct Source;
 
@@ -2374,7 +2380,7 @@ mod test {
         );
         assert!(
             owner.contains(
-                "throw new BorrowingErrorException(new BorrowingError(result.Err, LifetimeEdge.Move(ref selfLease)));"
+                "throw new BorrowingErrorException(new BorrowingError(result.Err, new ILifetimeEdge?[] { LifetimeEdge.Move(ref selfLease) }));"
             ),
             "error path should retain the receiver directly, at the inner error's construction:\n{owner}"
         );
@@ -2419,7 +2425,7 @@ mod test {
         let owner = files.get("Owner.cs").expect("expected Owner.cs output");
         assert!(
             owner.contains(
-                "throw new BorrowingErrorException(new BorrowingError(result.Err, LifetimeEdge.Move(ref selfLease)));"
+                "throw new BorrowingErrorException(new BorrowingError(result.Err, new ILifetimeEdge?[] { LifetimeEdge.Move(ref selfLease) }));"
             ),
             "error path should retain the receiver directly, at the inner error's construction:\n{owner}"
         );
@@ -3222,14 +3228,14 @@ mod test {
 {config}"
         );
         assert!(
-            config.contains("        get") && config.contains("        set"),
+            property_getter_count(config) == 1 && config.contains("        set"),
             "expected one property carrying both accessors, got:
 {config}"
         );
         // The accessor *is* the property: its body is inline and there is no
         // second member to collide with, as in the Dart and JS backends.
         assert!(
-            config.contains("Raw.Config.Size(AsFFI())"),
+            config.contains("Raw.Config.Size(selfLease!.Ptr)"),
             "expected the getter body inline in the property, got:
 {config}"
         );
@@ -3263,7 +3269,7 @@ mod test {
 {config}"
         );
         assert!(
-            !config.contains("        get"),
+            property_getter_count(config) == 0,
             "there is no getter to read through, got:
 {config}"
         );
@@ -3790,7 +3796,7 @@ mod test {
 {config}"
             );
             assert_eq!(
-                config.matches("        get").count(),
+                property_getter_count(config),
                 1,
                 "expected one getter for {param}, got:
 {config}"
@@ -3860,7 +3866,7 @@ mod test {
 {config}"
             );
             assert_eq!(
-                config.matches("        get").count(),
+                property_getter_count(config),
                 1,
                 "expected exactly one getter, got:
 {config}"
@@ -4144,7 +4150,7 @@ mod test {
 {config}"
         );
         assert!(
-            !config.contains("        get"),
+            property_getter_count(config) == 0,
             "a static accessor must not become a property, got:
 {config}"
         );
@@ -4203,7 +4209,7 @@ mod test {
         );
         let config = files.get("Config.cs").expect("expected Config.cs output");
         assert!(
-            config.contains("Raw.Config.SetSize(AsFFI(), value)"),
+            config.contains("Raw.Config.SetSize(selfLease!.Ptr, value)"),
             "the property must pass the implicit `value`, got:
 {config}"
         );
