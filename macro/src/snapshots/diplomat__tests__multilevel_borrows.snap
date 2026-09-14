@@ -25,6 +25,9 @@ mod ffi {
     #[no_mangle]
     #[allow(deprecated)]
     extern "C" fn Bar_destroy<'b, 'a: 'b>(this: Box<Bar<'b, 'a>>) {}
+    impl<'b, 'a: 'b> Drop for Bar<'b, 'a> {
+        fn drop(&mut self) {}
+    }
     #[no_mangle]
     #[allow(deprecated)]
     extern "C" fn Foo_new<'a>(
@@ -46,4 +49,7 @@ mod ffi {
     #[no_mangle]
     #[allow(deprecated)]
     extern "C" fn Foo_destroy<'a>(this: Box<Foo<'a>>) {}
+    impl<'a> Drop for Foo<'a> {
+        fn drop(&mut self) {}
+    }
 }

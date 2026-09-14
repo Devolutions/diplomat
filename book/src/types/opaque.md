@@ -105,3 +105,18 @@ There are some [soundness concerns](https://github.com/rust-diplomat/diplomat/is
 Currently the full set of checks is not implemented yet. The general idea is that any type that can be mutated over FFI should not also hand out references to stuff within itself (copies are fine).
 
 If you need that property to implement borrowing iterators, consider using a `Cell` to store iterator state.
+
+# Destructors
+
+Diplomat generates the destructor for every opaque type, and with it an empty `impl Drop`. A
+hand-written `impl Drop` for an opaque is therefore a compile error (E0119), inside or outside
+the bridge module. The rule exists because a foreign runtime may destroy a parent before a
+value that borrows from it, and a custom destructor that reads the parent would read freed
+memory.
+
+Field destructors still run. Keep them free of access to memory borrowed from another opaque;
+the generated `Drop` cannot check that for you.
+
+Two Rust consequences follow from the generated `Drop`: an opaque type cannot derive `Copy`
+(E0184), and a field cannot be moved out of an opaque value (E0509). Use `Option::take`,
+`mem::take`, or a clone instead.

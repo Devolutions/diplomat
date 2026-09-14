@@ -27,3 +27,5 @@ pretty-print = ["diplomat_core/pretty-print"]
 [dev-dependencies]
 insta = "1.7.1"
 prettyplease = "0.3.0"
+trybuild = "1.0"
+diplomat-runtime.workspace = true

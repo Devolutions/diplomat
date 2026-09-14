@@ -625,6 +625,13 @@ fn gen_bridge(mut input: ItemMod) -> ItemMod {
                 #[allow(deprecated)]
                 extern "C" fn #destroy_ident #lifetime_defs(this: Box<#type_ident #lifetimes>) {}
             }));
+
+            new_contents.push(Item::Impl(syn::parse_quote! {
+                #cfg
+                impl #lifetime_defs Drop for #type_ident #lifetimes {
+                    fn drop(&mut self) {}
+                }
+            }));
         }
     }
 

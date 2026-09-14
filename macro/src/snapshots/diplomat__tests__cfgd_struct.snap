@@ -23,4 +23,8 @@ mod ffi {
     #[cfg(feature = "foo")]
     #[allow(deprecated)]
     extern "C" fn Foo_destroy(this: Box<Foo>) {}
+    #[cfg(feature = "foo")]
+    impl Drop for Foo {
+        fn drop(&mut self) {}
+    }
 }
