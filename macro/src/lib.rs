@@ -626,8 +626,11 @@ fn gen_bridge(mut input: ItemMod) -> ItemMod {
                 extern "C" fn #destroy_ident #lifetime_defs(this: Box<#type_ident #lifetimes>) {}
             }));
 
+            // Consumers may opt into clippy's restriction lints; the policy impl is
+            // deliberately empty, so it must not fail their builds.
             new_contents.push(Item::Impl(syn::parse_quote! {
                 #cfg
+                #[allow(clippy::empty_drop)]
                 impl #lifetime_defs Drop for #type_ident #lifetimes {
                     fn drop(&mut self) {}
                 }

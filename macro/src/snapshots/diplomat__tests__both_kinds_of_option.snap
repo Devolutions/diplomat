@@ -97,6 +97,7 @@ mod ffi {
     #[no_mangle]
     #[allow(deprecated)]
     extern "C" fn Foo_destroy(this: Box<Foo>) {}
+    #[allow(clippy::empty_drop)]
     impl Drop for Foo {
         fn drop(&mut self) {}
     }

@@ -25,6 +25,7 @@ mod ffi {
     #[no_mangle]
     #[allow(deprecated)]
     extern "C" fn Bar_destroy<'b, 'a: 'b>(this: Box<Bar<'b, 'a>>) {}
+    #[allow(clippy::empty_drop)]
     impl<'b, 'a: 'b> Drop for Bar<'b, 'a> {
         fn drop(&mut self) {}
     }
@@ -49,6 +50,7 @@ mod ffi {
     #[no_mangle]
     #[allow(deprecated)]
     extern "C" fn Foo_destroy<'a>(this: Box<Foo<'a>>) {}
+    #[allow(clippy::empty_drop)]
     impl<'a> Drop for Foo<'a> {
         fn drop(&mut self) {}
     }

@@ -24,6 +24,7 @@ mod ffi {
     #[allow(deprecated)]
     extern "C" fn Foo_destroy(this: Box<Foo>) {}
     #[cfg(feature = "foo")]
+    #[allow(clippy::empty_drop)]
     impl Drop for Foo {
         fn drop(&mut self) {}
     }
