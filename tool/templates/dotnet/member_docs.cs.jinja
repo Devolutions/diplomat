@@ -9,10 +9,12 @@
 {%- if let Some(lifetime) = docs.lifetime %}
     /// <remarks>
     /// Lifetime: the returned native-backed value may borrow from the receiver or one or more inputs.
-    /// The caller is responsible for keeping any borrowed backing storage alive and undisposed while the returned value is in use.
+    /// Source handles stay reachable while the returned value exists.
 {%- if lifetime.pinned_inputs %}
     /// <br/>
-    /// The buffer passed via <c>ReadOnlyMemory</c> stays pinned until the returned value is disposed; do not mutate it while the returned value is in use.
+    /// Warning: this call pins the buffer passed via <c>ReadOnlyMemory</c> for as long as the returned value, and anything borrowing from it, is alive.
+    /// The pin is released by <c>Dispose()</c> when the type has one, otherwise only when the garbage collector finalizes the value.
+    /// Do not mutate the buffer while the returned value is in use, and keep the returned value short-lived if the buffer is large.
 {%- endif %}
     /// </remarks>
 {%- endif %}

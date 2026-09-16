@@ -46,21 +46,14 @@ impl Display for RawExprParseError {
     }
 }
 
-/// Builds the C# expression that retains every direct opaque borrow source
-/// for one arm (success or error) of a method's output, right where a
-/// generated constructor call for that output needs it — an `object[]`
-/// literal of freshly-retained dependency tokens, one call to
-/// `{expr}.DiplomatRetainDependency()` per source in `sources`, or
-/// `"System.Array.Empty<object>()"` when there are none.
+/// Builds the C# expression that carries every direct opaque borrow source for
+/// one output arm. The source lease is moved into the returned resource handle;
+/// no native ownership claim is created.
 pub(crate) fn dependencies_array_expr(sources: &[String]) -> String {
     if sources.is_empty() {
-        "System.Array.Empty<object>()".to_string()
+        "System.Array.Empty<ILifetimeEdge?>()".to_string()
     } else {
-        let args: Vec<String> = sources
-            .iter()
-            .map(|s| format!("{s}.DiplomatRetainDependency()"))
-            .collect();
-        format!("new object[] {{ {} }}", args.join(", "))
+        format!("new ILifetimeEdge?[] {{ {} }}", sources.join(", "))
     }
 }
 
@@ -232,7 +225,13 @@ impl<'ctx> MethodInputContext<'ctx> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ownership {
     Owned,
-    Borrowed,
+    Borrowed(hir::Mutability),
+}
+
+impl Ownership {
+    fn is_owned(self) -> bool {
+        matches!(self, Self::Owned)
+    }
 }
 
 /// Element type carried by a borrowed slice/string return
@@ -426,30 +425,17 @@ impl DotnetReturnType {
         }
     }
 
-    /// `new object[] { ... }`, or the shared empty-array constant when there
-    /// are no pins to root — used by an owned opaque return's own pinned
-    /// input buffers.
-    fn edges_array_expr(edges: &[String]) -> String {
-        if edges.is_empty() {
-            "System.Array.Empty<object>()".to_string()
-        } else {
-            format!("new object[] {{ {} }}", edges.join(", "))
-        }
-    }
-
-    /// One combined `object[]` literal for an opaque construction's `edges`
-    /// argument: `dependencies` (opaque-param borrow sources, each suffixed
-    /// with `.DiplomatRetainDependency()` so the call retains the source
-    /// right at construction) followed by `pins` (this return's own pinned
-    /// input buffers, rooted bare). Both end up in the same wrapper `_edges`
-    /// field (see `opaque.impl.cs.jinja`), so one array covers both.
-    fn opaque_edges_expr(dependencies: &[String], pins: &[String]) -> String {
-        let combined: Vec<String> = dependencies
+    fn opaque_edges_args(dependencies: &[String], pins: &[String]) -> String {
+        let edges: Vec<String> = dependencies
             .iter()
-            .map(|d| format!("{d}.DiplomatRetainDependency()"))
+            .cloned()
             .chain(pins.iter().cloned())
             .collect();
-        Self::edges_array_expr(&combined)
+        if edges.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", edges.join(", "))
+        }
     }
 
     /// Build the C# expression that wraps a raw opaque pointer. An owned
@@ -458,10 +444,8 @@ impl DotnetReturnType {
     /// caller decides which via [`Ownership`] — no `owned` flag leaks into the
     /// generated arguments.
     ///
-    /// `dependencies` and `pins` both end up in the same combined `edges`
-    /// argument (see [`Self::opaque_edges_expr`]) — there is only ever one
-    /// generated constructor shape to pick between (with or without edges),
-    /// regardless of ownership.
+    /// `dependencies` and `pins` both become managed lifetime edges on the
+    /// resource handle.
     fn opaque_construction(
         name: &str,
         raw_expr: &RawExpr,
@@ -469,29 +453,16 @@ impl DotnetReturnType {
         pins: &[String],
         ownership: Ownership,
     ) -> String {
-        let no_edges = dependencies.is_empty() && pins.is_empty();
+        let edges = Self::opaque_edges_args(dependencies, pins);
         match ownership {
-            Ownership::Owned => {
-                if no_edges {
-                    format!("new {name}({raw_expr})")
-                } else {
-                    format!(
-                        "new {name}({raw_expr}, {})",
-                        Self::opaque_edges_expr(dependencies, pins)
-                    )
-                }
-            }
+            Ownership::Owned => format!("new {name}({raw_expr}{edges})"),
             // `new {name}(...)` (not `{name}.Borrowed(...)`) so the type
             // always resolves even when the wrapper has a same-named method.
-            Ownership::Borrowed => {
-                if no_edges {
-                    format!("new {name}(RustHandle<Raw.{name}>.Borrowed({raw_expr}))")
-                } else {
-                    format!(
-                        "new {name}(RustHandle<Raw.{name}>.Borrowed({raw_expr}, {}))",
-                        Self::opaque_edges_expr(dependencies, pins)
-                    )
-                }
+            Ownership::Borrowed(hir::Mutability::Immutable) => {
+                format!("new {name}({raw_expr}, WrapperKind.SharedView{edges})")
+            }
+            Ownership::Borrowed(hir::Mutability::Mutable) => {
+                format!("new {name}({raw_expr}, WrapperKind.ExclusiveView{edges})")
             }
         }
     }
@@ -510,8 +481,8 @@ impl DotnetReturnType {
                 Self::opaque_construction(name, &raw_expr, dependencies, pins, ownership)
             }
             Self::Struct(name) => format!("{name}.FromFFI({raw_expr})"),
-            // Rust still owns this memory. The sealed span wrapper retains its
-            // opaque sources and releases those tokens from its finalizer.
+            // Rust still owns this memory. The span wrapper validates its
+            // source-handle edges before each access.
             Self::BorrowedSpan(elem) => {
                 debug_assert!(
                     pins.is_empty(),
@@ -601,10 +572,13 @@ struct InputLowering {
     /// Empty for self — `this` is implicit.
     idiomatic_param: String,
     /// Expression passed to the raw call from the idiomatic body:
-    /// `"_inner"` / `"this.AsFFI()"` for self, `"name._inner"` for an opaque
+    /// `"selfLease!.Ptr"` for self, `"nameLease!.Ptr"` for an opaque
     /// param, `"v"` for a primitive.
     raw_call_arg: String,
     validation_statement: Option<String>,
+    borrow_declaration: Option<String>,
+    borrow_statement: Option<String>,
+    borrow_lease: Option<OpaqueBorrowLease>,
 
     /// Statements that must run calling into the raw layer — e.g. the DiplomatStr
     fix_statement: Option<String>,
@@ -624,6 +598,12 @@ struct InputLowering {
     /// `Some` for a `ReadOnlyMemory` param the output borrows — pin statements
     /// and the keep-alive edge both derive from it.
     borrowed_slice_pin: Option<SlicePin>,
+}
+
+#[derive(Debug, Clone)]
+struct OpaqueBorrowLease {
+    source: String,
+    lease_expr: String,
 }
 
 /// A borrowed slice param pinned for the returned wrapper's lifetime: the
@@ -670,6 +650,10 @@ pub(super) struct DotnetInputs {
     /// Raw call args from the idiomatic body: `"_inner, value"`.
     pub(super) raw_call_args: String,
     pub(super) validation_statements: Vec<String>,
+    pub(super) borrow_declarations: Vec<String>,
+    pub(super) borrow_statements: Vec<String>,
+    pub(super) borrow_release_statements: Vec<String>,
+    borrow_leases: Vec<OpaqueBorrowLease>,
     pub(super) fix_statements: Vec<String>,
     pub(super) to_bytes_statements: Vec<String>,
     /// The value a setter assigns, i.e. what its property exposes. `None` for
@@ -724,13 +708,9 @@ pub(super) struct MethodInfo<'ctx> {
     pub(super) inputs: DotnetInputs,
     pub(super) return_type: DotnetReturnType,
     pub(super) lifetime_warning: bool,
-    /// Direct opaque-param/`this` borrow edges the returned wrapper retains
-    /// via the RC mechanism (`DiplomatRetainDependency()` /
-    /// `RustHandle<T>` — see `RustHandle.cs.jinja`): the source's
-    /// physical Rust destructor is deferred until this dependent (and every
-    /// other holder) has released its reference, regardless of which
-    /// wrapper's managed lifetime ends first. Each entry is the bare C#
-    /// expression naming the source (`"this"` or a parameter's local name).
+    /// Direct opaque-param/`this` borrow edges moved into the returned handle.
+    /// The edge keeps the source handle reachable without adding native
+    /// ownership. Each entry is the generated edge expression.
     pub(super) keep_alive_sources: Vec<String>,
     /// This return's own pinned input buffers (`&[u8]`/`&[u32]`/
     /// `&DiplomatStr`/`&DiplomatStr16` params rooted as `DiplomatPinnedMemory`)
@@ -741,7 +721,7 @@ pub(super) struct MethodInfo<'ctx> {
     pub(super) keep_alive_pins: Vec<String>,
     /// Same idea as `keep_alive_sources` but for the thrown exception
     /// when the error type carries non-static lifetimes — routed through the
-    /// inner error opaque's own RC state (see `DotnetErrorType::exception_inner_expr`)
+    /// inner error opaque's own managed edge state (see `DotnetErrorType::exception_inner_expr`)
     /// rather than a separate array on the exception class itself. Pins never
     /// apply to the error arm (an exception has no unpin path), so this is
     /// always a pure dependency list.
@@ -853,7 +833,7 @@ impl MethodInfo<'_> {
     /// `extra` is the caller's own nesting, as literal spaces: empty inside a
     /// method, one level inside a property accessor, which sits a block deeper.
     pub(super) fn body_indent(&self, extra: &str) -> String {
-        let base = match (
+        let mut base = match (
             self.inputs.borrowed_slice_pins.is_empty(),
             self.inputs.fix_statements.is_empty(),
         ) {
@@ -861,13 +841,28 @@ impl MethodInfo<'_> {
             (false, false) => 20,
             _ => 16,
         };
+        if !self.inputs.borrow_statements.is_empty() {
+            base += 4;
+        }
         format!("{extra}{}", " ".repeat(base))
     }
 
     /// Indent for the `fixed (...)` lines — one level deeper when they sit
     /// inside the pin `try { ... }` block.
     pub(super) fn fix_indent(&self, extra: &str) -> String {
-        let base = if self.inputs.borrowed_slice_pins.is_empty() {
+        let mut base = if self.inputs.borrowed_slice_pins.is_empty() {
+            12
+        } else {
+            16
+        };
+        if !self.inputs.borrow_statements.is_empty() {
+            base += 4;
+        }
+        format!("{extra}{}", " ".repeat(base))
+    }
+
+    pub(super) fn borrow_body_indent(&self, extra: &str) -> String {
+        let base = if self.inputs.borrow_statements.is_empty() {
             12
         } else {
             16
@@ -1059,7 +1054,7 @@ impl MethodInfo<'_> {
 
     /// Full public return statement for a raw success expression. This keeps
     /// nullable option, opaque wrapping, and struct bridging out of the C#
-    /// control-flow template. `dependencies` are retained directly, right at
+    /// control-flow template. `dependencies` are moved directly, right at
     /// this construction site — never through a pre-call transaction.
     pub(super) fn success_return_statement<R>(&self, raw_expr: R) -> String
     where
@@ -1098,7 +1093,7 @@ impl MethodInfo<'_> {
     }
 
     /// The `throw new …(result.Err, …);` statement for the error arm, with
-    /// `error_keep_alive_sources` retained directly, right at the inner error
+    /// `error_keep_alive_sources` moved directly, right at the inner error
     /// opaque's own construction, so its source(s) stay alive for at least as
     /// long as the error opaque itself does.
     pub(super) fn error_throw_statement(&self) -> String {
@@ -1128,8 +1123,7 @@ struct ImmutableElementShape<'a> {
 }
 
 /// One output type's keep-alive edges, split by release path: real
-/// cross-wrapper native dependencies (destined for the RC mechanism) versus
-/// this-wrapper-only pin holders (see `output_keep_alive_edges`).
+/// cross-wrapper managed source edges versus this-wrapper-only pin holders.
 type OutputKeepAliveEdges = (Vec<String>, Vec<String>);
 
 /// `borrowed_output_keep_alive_edges`'s full result: the success return
@@ -1206,6 +1200,9 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
                 )
             })
             .collect();
+        let manually_disposable_sources =
+            self.manually_disposable_borrow_sources(method, &param_borrows);
+        let exclusive_sources = self.exclusive_borrow_sources(method, &param_borrows);
         let borrow_map = visitor.borrow_map();
 
         let inputs = self.lower_inputs(method_context, param_borrows)?;
@@ -1223,10 +1220,30 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
 
         let accessor = self.accessor_info(method, &return_type, option_info.is_some(), &inputs);
         let KeepAliveResult {
-            ok_dependencies: keep_alive_sources,
+            ok_dependencies,
             ok_pins: keep_alive_pins,
-            err_dependencies: error_keep_alive_sources,
+            err_dependencies,
         } = self.borrowed_output_keep_alive_edges(method, &inputs, &borrow_map, ownership)?;
+        if self.reject_manually_disposable_borrows(
+            &method_name,
+            &manually_disposable_sources,
+            &ok_dependencies,
+            &err_dependencies,
+        ) {
+            return None;
+        }
+        if self.reject_undisposable_exclusive_borrows(
+            &method_name,
+            &method.output,
+            ownership,
+            &exclusive_sources,
+            &ok_dependencies,
+            &err_dependencies,
+        ) {
+            return None;
+        }
+        let keep_alive_sources = self.borrow_dependencies(&inputs, ok_dependencies)?;
+        let error_keep_alive_sources = self.borrow_dependencies(&inputs, err_dependencies)?;
         let lifetime_warning = !keep_alive_sources.is_empty() || !keep_alive_pins.is_empty();
 
         // A non-opaque, non-borrowed-span success return drops edges silently
@@ -1299,6 +1316,160 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
         ))
     }
 
+    fn manually_disposable_borrow_sources(
+        &self,
+        method: &'tcx Method,
+        param_borrows: &[(ParamNames, ParamBorrowInfo<'tcx>)],
+    ) -> BTreeMap<String, String> {
+        let mut sources = BTreeMap::new();
+
+        if let Some(param_self) = method.param_self.as_ref() {
+            if let hir::SelfType::Opaque(path) = &param_self.ty {
+                if path.resolve(self.tcx).attrs.manually_disposable {
+                    sources.insert("this".to_string(), self.opaque_name_borrowed(path));
+                }
+            }
+        }
+
+        for (param, (names, _)) in method.params.iter().zip(param_borrows) {
+            if let hir::Type::Opaque(path) = &param.ty {
+                if path.resolve(self.tcx).attrs.manually_disposable {
+                    sources.insert(names.local.clone(), self.opaque_name_borrowed(path));
+                }
+            }
+        }
+
+        sources
+    }
+
+    /// The receiver and opaque parameters this method borrows exclusively (`&mut`),
+    /// keyed by the local name the generated body uses, valued by the C# type name.
+    fn exclusive_borrow_sources(
+        &self,
+        method: &'tcx Method,
+        param_borrows: &[(ParamNames, ParamBorrowInfo<'tcx>)],
+    ) -> BTreeMap<String, String> {
+        let mut sources = BTreeMap::new();
+
+        if let Some(param_self) = method.param_self.as_ref() {
+            if let hir::SelfType::Opaque(path) = &param_self.ty {
+                if matches!(param_self.get_mutability(), hir::Mutability::Mutable) {
+                    sources.insert("this".to_string(), self.opaque_name_borrowed(path));
+                }
+            }
+        }
+
+        for (param, (names, _)) in method.params.iter().zip(param_borrows) {
+            if let hir::Type::Opaque(path) = &param.ty {
+                if matches!(path.owner.mutability, hir::Mutability::Mutable) {
+                    sources.insert(names.local.clone(), self.opaque_name_borrowed(path));
+                }
+            }
+        }
+
+        sources
+    }
+
+    /// A value born from an exclusive borrow is its source's only writer, so it keeps
+    /// that borrow until it is released. Without `Dispose()` the only release is
+    /// finalization, which would leave the source locked for an unbounded time.
+    fn reject_undisposable_exclusive_borrows(
+        &self,
+        method_name: &str,
+        output: &hir::ReturnType,
+        ownership: Ownership,
+        exclusive_sources: &BTreeMap<String, String>,
+        ok_dependencies: &[String],
+        err_dependencies: &[String],
+    ) -> bool {
+        let (ok_ty, err_ty) = match output {
+            hir::ReturnType::Infallible(s) | hir::ReturnType::Nullable(s) => (s.as_type(), None),
+            hir::ReturnType::Fallible(s, e) => (s.as_type(), e.as_ref()),
+        };
+
+        let mut rejected = false;
+        // A shared view lets go of its borrow at construction, whatever it came from.
+        if !matches!(ownership, Ownership::Borrowed(hir::Mutability::Immutable)) {
+            rejected |= self.reject_undisposable_exclusive_arm(
+                method_name,
+                "return value",
+                ok_ty,
+                exclusive_sources,
+                ok_dependencies,
+            );
+        }
+        rejected |= self.reject_undisposable_exclusive_arm(
+            method_name,
+            "error value",
+            err_ty,
+            exclusive_sources,
+            err_dependencies,
+        );
+        rejected
+    }
+
+    fn reject_undisposable_exclusive_arm(
+        &self,
+        method_name: &str,
+        what: &str,
+        ty: Option<&hir::OutType>,
+        exclusive_sources: &BTreeMap<String, String>,
+        dependencies: &[String],
+    ) -> bool {
+        let Some(hir::Type::Opaque(path)) = ty else {
+            return false;
+        };
+        let held: Vec<String> = dependencies
+            .iter()
+            .filter_map(|source| {
+                exclusive_sources
+                    .get(source)
+                    .map(|source_type| format!("`{source}` of type `{source_type}`"))
+            })
+            .collect();
+        if held.is_empty() || path.resolve(self.tcx).attrs.manually_disposable {
+            return false;
+        }
+
+        let returned = self.opaque_name(path);
+        self.errors.push_error(format!(
+            "[.NET backend] {what} of method `{method_name}` is `{returned}`, which keeps an \
+             exclusive borrow of {} until it is released; mark `{returned}` \
+             `#[diplomat::attr(dotnet, manually_disposable)]` so the caller can end the borrow \
+             with `Dispose()`, or return a value that does not borrow",
+            held.join(", ")
+        ));
+        true
+    }
+
+    fn reject_manually_disposable_borrows(
+        &self,
+        method_name: &str,
+        source_types: &BTreeMap<String, String>,
+        ok_dependencies: &[String],
+        err_dependencies: &[String],
+    ) -> bool {
+        let retained_sources: BTreeSet<String> = ok_dependencies
+            .iter()
+            .chain(err_dependencies)
+            .cloned()
+            .collect();
+        let mut rejected = false;
+
+        for source in retained_sources {
+            if let Some(source_type) = source_types.get(&source) {
+                self.errors.push_error(format!(
+                    "[.NET backend] method `{method_name}` returns a value that retains a borrow \
+                     from manually disposable source `{source}` of type `{source_type}`; return \
+                     an independent value or remove `manually_disposable` from `{source_type}`"
+                ));
+                rejected = true;
+            }
+        }
+
+        rejected
+    }
+
     /// Sometimes a method hands back a value that's really just pointing into
     /// another object instead of owning its own. If the garbage collector frees
     /// that other object too early, the returned value is left pointing at freed
@@ -1306,9 +1477,9 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
     /// if it borrows from the receiver, or the parameter's name if it borrows
     /// from a parameter.
     ///
-    /// An `OpaqueParam` edge is a real cross-wrapper native dependency —
-    /// retained via the RC mechanism (see `dependencies_array_expr`)
-    /// so the source's physical destruction is deferred correctly. A
+    /// An `OpaqueParam` edge is a managed source-handle dependency (see
+    /// `dependencies_array_expr`). Retained edges from manually disposable
+    /// sources are rejected before templates render. A
     /// `&[u8]`/`&[u32]` param the success value borrows contributes its own
     /// pin holder instead — an unrelated, this-wrapper-only concern (see
     /// `edges_array_expr`), never shared with another wrapper. For borrows we
@@ -1337,7 +1508,7 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
 
         // A borrowed return's Dispose never runs Rust's destructor, so
         // unpinning there would free the buffer while Rust still holds it.
-        let ok_pins: &[SlicePin] = if ownership == Ownership::Owned {
+        let ok_pins: &[SlicePin] = if ownership.is_owned() {
             &inputs.borrowed_slice_pins
         } else {
             &[]
@@ -1367,6 +1538,29 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
         })
     }
 
+    fn borrow_dependencies(
+        &self,
+        inputs: &DotnetInputs,
+        sources: Vec<String>,
+    ) -> Option<Vec<String>> {
+        sources
+            .into_iter()
+            .map(|source| {
+                inputs
+                    .borrow_leases
+                    .iter()
+                    .find(|lease| lease.source == source)
+                    .map(|lease| format!("LifetimeEdge.Move(ref {})", lease.lease_expr))
+                    .or_else(|| {
+                        self.errors.push_error(format!(
+                            "[.NET backend] no borrow lease was generated for opaque source `{source}`"
+                        ));
+                        None
+                    })
+            })
+            .collect()
+    }
+
     /// Keep-alive edges contributed by one output type: the receiver / opaque
     /// parameters its non-static lifetimes borrow from, looked up in the
     /// method's borrow map. This mirrors how the other backends derive lifetime
@@ -1376,7 +1570,7 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
     /// (diagnostic pushed) for borrow kinds the backend can't keep alive yet.
     ///
     /// Returns `(dependencies, pins)`: `OpaqueParam` edges (real cross-wrapper
-    /// native dependencies, destined for the RC mechanism) are kept separate
+    /// source-handle edges) are kept separate
     /// from `SliceParam` pin holders (this wrapper's own pinned buffer,
     /// unrelated to any other wrapper) because the two have entirely
     /// different release paths on the C# side. Each dependency is the bare
@@ -1606,7 +1800,7 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
                 ownership = if p.is_owned() {
                     Ownership::Owned
                 } else {
-                    Ownership::Borrowed
+                    Ownership::Borrowed(p.owner.mutability())
                 };
                 if p.is_optional() {
                     pointer_nullable = true;
@@ -1649,7 +1843,7 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
                     // Span never owns the bytes — pin holders must not ride
                     // on it (no Dispose to unpin). Slice-param borrow edges
                     // are rejected later via ownership == Borrowed.
-                    ownership = Ownership::Borrowed;
+                    ownership = Ownership::Borrowed(hir::Mutability::Immutable);
                     DotnetReturnType::BorrowedSpan(elem)
                 }
                 // Owned string returns (`Box<str>`) need the separately-decided
@@ -1686,7 +1880,7 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
                             return None;
                         }
                     };
-                    ownership = Ownership::Borrowed;
+                    ownership = Ownership::Borrowed(reference.mutability);
                     DotnetReturnType::BorrowedSpan(elem)
                 }
                 hir::Slice::Primitive(MaybeOwn::Own, primitive_type) => {
@@ -1801,8 +1995,12 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
         param_borrows: Vec<(ParamNames, ParamBorrowInfo<'tcx>)>,
     ) -> Option<DotnetInputs> {
         let method = method_context.method();
+        let mut used_local_names = param_borrows
+            .iter()
+            .map(|(names, _)| names.local.clone())
+            .collect();
         let self_lowering = match method.param_self.as_ref() {
-            Some(s) => Some(self.lower_self(s)?),
+            Some(s) => Some(self.lower_self(s, &mut used_local_names)?),
             None => None,
         };
         let mut param_lowerings: Vec<InputLowering> = Vec::with_capacity(method.params.len());
@@ -1812,6 +2010,7 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
             param_lowerings.push(self.lower_input(
                 MethodInputContext::new(method_context, index, p, names.raw, names.local),
                 borrow_info,
+                &mut used_local_names,
             )?);
         }
 
@@ -1819,6 +2018,10 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
         let mut idiomatic_params = Vec::new();
         let mut call_args = Vec::new();
         let mut validation_statements = Vec::new();
+        let mut borrow_declarations = Vec::new();
+        let mut borrow_statements = Vec::new();
+        let mut borrow_release_statements = Vec::new();
+        let mut borrow_leases = Vec::new();
         let mut fix_statements = Vec::new();
         let mut to_bytes_statements = Vec::new();
         let mut setter_value = None;
@@ -1830,6 +2033,16 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
             call_args.push(s.raw_call_arg.as_str());
             if let Some(target) = &s.keep_alive_target {
                 keep_alive_targets.push(target.clone());
+            }
+            if let Some(statement) = &s.borrow_statement {
+                borrow_statements.push(statement.clone());
+            }
+            if let Some(declaration) = &s.borrow_declaration {
+                borrow_declarations.push(declaration.clone());
+            }
+            if let Some(lease) = &s.borrow_lease {
+                borrow_leases.push(lease.clone());
+                borrow_release_statements.push(format!("{}?.Release();", lease.lease_expr));
             }
             // self contributes nothing to the idiomatic decl — `this` is implicit.
         }
@@ -1865,6 +2078,16 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
             if let Some(target) = &p.keep_alive_target {
                 keep_alive_targets.push(target.clone());
             }
+            if let Some(statement) = &p.borrow_statement {
+                borrow_statements.push(statement.clone());
+            }
+            if let Some(declaration) = &p.borrow_declaration {
+                borrow_declarations.push(declaration.clone());
+            }
+            if let Some(lease) = &p.borrow_lease {
+                borrow_leases.push(lease.clone());
+                borrow_release_statements.push(format!("{}?.Release();", lease.lease_expr));
+            }
             if let Some(pin) = &p.borrowed_slice_pin {
                 borrowed_slice_pins.push(pin.clone());
             }
@@ -1875,6 +2098,10 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
             idiomatic_params: idiomatic_params.join(", "),
             raw_call_args: call_args.join(", "),
             validation_statements,
+            borrow_declarations,
+            borrow_statements,
+            borrow_release_statements,
+            borrow_leases,
             fix_statements,
             to_bytes_statements,
             setter_value,
@@ -1883,17 +2110,31 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
         })
     }
 
-    fn lower_self(&self, this: &hir::ParamSelf) -> Option<InputLowering> {
+    fn lower_self(
+        &self,
+        this: &hir::ParamSelf,
+        used_local_names: &mut BTreeSet<String>,
+    ) -> Option<InputLowering> {
         Some(match &this.ty {
             hir::SelfType::Opaque(p) => {
                 let name = self.opaque_name_borrowed(p);
+                let kind = match this.get_mutability() {
+                    hir::Mutability::Immutable => "BorrowKind.Shared",
+                    hir::Mutability::Mutable => "BorrowKind.Exclusive",
+                };
+                let lease_var = Self::unique_local_name(used_local_names, "selfLease".to_string());
                 InputLowering {
                     raw_param: format!("{name}* handle"),
                     idiomatic_param: String::new(),
-                    // `GC.KeepAlive(this)` after the call keeps the pointer
-                    // alive across it.
-                    raw_call_arg: "AsFFI()".into(),
-                    keep_alive_target: Some("this".into()),
+                    raw_call_arg: format!("{lease_var}!.Ptr"),
+                    borrow_declaration: Some(format!(
+                        "BorrowLease<Raw.{name}>? {lease_var} = null;"
+                    )),
+                    borrow_statement: Some(format!("{lease_var} = Handle.Lease({kind});")),
+                    borrow_lease: Some(OpaqueBorrowLease {
+                        source: "this".into(),
+                        lease_expr: lease_var,
+                    }),
                     ..Default::default()
                 }
             }
@@ -1932,6 +2173,21 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
         self.formatter
             .fmt_param_name(&format!("{base}{suffix}"))
             .into_owned()
+    }
+
+    fn unique_local_name(used: &mut BTreeSet<String>, preferred: String) -> String {
+        if used.insert(preferred.clone()) {
+            return preferred;
+        }
+
+        for suffix in 2.. {
+            let candidate = format!("{preferred}{suffix}");
+            if used.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
+
+        unreachable!()
     }
 
     /// Lowers a parameter that's always immutable and always borrowed, and
@@ -2016,6 +2272,7 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
         &self,
         input_context: MethodInputContext<'tcx>,
         borrow_info: ParamBorrowInfo<'tcx>,
+        used_local_names: &mut BTreeSet<String>,
     ) -> Option<InputLowering> {
         let arg_name = input_context.local_name();
         let raw_name = input_context.raw_name();
@@ -2045,47 +2302,52 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
             hir::Type::Opaque(p) => {
                 let ty = self.opaque_name_borrowed(p);
                 let optional = p.is_optional();
+                let kind = match p.owner.mutability {
+                    hir::Mutability::Immutable => "BorrowKind.Shared",
+                    hir::Mutability::Mutable => "BorrowKind.Exclusive",
+                };
                 let idiomatic_ty = if optional {
                     format!("{ty}?")
                 } else {
                     ty.clone()
                 };
-                // Cache `AsFFI()` to a local — calling it once for the
-                // null check and again at the call site is wasted. The
-                // disposed check then guards against a use-after-Dispose
-                // without invoking `AsFFI()` twice.
-                // The opaque is non-nullable in the C# signature (`Locale
-                // locale`), but the warning is suppressible — a caller
-                // compiled without `#nullable enable` can still hand us
-                // null. Surface `ArgumentNullException` (vs. the
-                // `NullReferenceException` a bare `.AsFFI()` would throw)
-                // so the failure mode names the bad argument. Matches
-                // the callback-input validation at `lower_callback_input`.
-                let raw_var = format!("{arg_name}Raw");
+                let lease_var = Self::unique_local_name(
+                    used_local_names,
+                    self.slice_local_name(input_context.local_base(), "Lease"),
+                );
                 let validation_statement = if optional {
-                    Some(format!(
-                        "Raw.{ty}* {raw_var} = {arg_name} == null ? null : {arg_name}.AsFFI();\n\
-                         if ({arg_name} != null && {raw_var} == null) throw new ObjectDisposedException(nameof({ty}));"
-                    ))
+                    None
                 } else {
                     Some(format!(
-                        "if ({arg_name} == null) throw new ArgumentNullException(nameof({arg_name}));\n\
-                         Raw.{ty}* {raw_var} = {arg_name}.AsFFI();\n\
-                         if ({raw_var} == null) throw new ObjectDisposedException(nameof({ty}));"
+                        "if ({arg_name} == null) throw new ArgumentNullException(nameof({arg_name}));"
                     ))
                 };
-                let raw_call_arg = raw_var;
+                let borrow_statement = if optional {
+                    format!(
+                        "{lease_var} = {arg_name} == null ? null : {arg_name}.Handle.Lease({kind});"
+                    )
+                } else {
+                    format!("{lease_var} = {arg_name}.Handle.Lease({kind});")
+                };
                 InputLowering {
                     raw_param: format!("{ty}* {raw_name}"),
                     idiomatic_param: format!("{idiomatic_ty} {arg_name}"),
-                    raw_call_arg,
+                    raw_call_arg: if optional {
+                        format!("{lease_var} == null ? null : {lease_var}.Ptr")
+                    } else {
+                        format!("{lease_var}!.Ptr")
+                    },
                     validation_statement,
+                    borrow_declaration: Some(format!("BorrowLease<Raw.{ty}>? {lease_var} = null;")),
+                    borrow_statement: Some(borrow_statement),
+                    borrow_lease: Some(OpaqueBorrowLease {
+                        source: arg_name.to_string(),
+                        lease_expr: lease_var,
+                    }),
                     accessor_value: Some(AccessorValue::nullable_if(
                         optional,
                         AccessorMarshal::Opaque(ty),
                     )),
-                    // Keep the param's wrapper alive across the call.
-                    keep_alive_target: Some(arg_name.to_string()),
                     ..Default::default()
                 }
             }
@@ -2144,6 +2406,9 @@ impl<'ctx, 'tcx> ItemGenContext<'ctx, 'tcx> {
                                     validation_statement: Some(format!(
                                         "if ({arg_name} == null) throw new ArgumentNullException(nameof({arg_name}));"
                                     )),
+                                    borrow_declaration: None,
+                                    borrow_statement: None,
+                                    borrow_lease: None,
                                     to_bytes_statement: Some(format!(
                                         "byte[] {bytes} = Diplomat.Utf8.Clone({arg_name});"
                                     )),

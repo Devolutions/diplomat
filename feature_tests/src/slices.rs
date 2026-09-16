@@ -4,7 +4,6 @@ pub mod ffi {
     use std::fmt::Write as _;
 
     #[diplomat::opaque_mut]
-    #[diplomat::attr(dotnet, manually_disposable)]
     #[derive(Debug)]
     pub struct MyString(String);
 
