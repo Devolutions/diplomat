@@ -20,7 +20,7 @@ public partial class RcDependent2: IDisposable
     /// Safety: you should not build two managed objects using the same raw handle (may cause use-after-free and double-free).
     /// <br/>
     /// This constructor assumes the raw struct is allocated on Rust side.
-    /// If implemented, the custom Drop implementation on Rust side WILL run on destruction.
+    /// The generated native destructor also runs field teardown.
     /// </remarks>
     internal unsafe RcDependent2(Raw.RcDependent2* handle)
     {

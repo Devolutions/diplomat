@@ -137,9 +137,10 @@ An owned return that borrows a managed slice or string parameter keeps that buff
 its handle is disposed or finalized. A type that also hands out borrows cannot be
 `manually_disposable`, so its pin lasts until finalization.
 
-A Rust destructor, including any custom `Drop`, must not read memory borrowed from another
-opaque: the runtime may finalize the parent first, and this backend no longer keeps a parent
-alive for a dependent's destructor. The generator cannot check this; keep it in review.
+Generated opaque types receive an empty Rust `Drop` implementation; see
+[Opaque types: Destructors](../types/opaque.md#destructors) for what that forbids. Binding
+authors must also ensure that field destructors do not access borrowed parent storage. The
+generated outer `Drop` does not prove that field-level precondition.
 
 By default, generated opaques are **finalizer-only**: no public `Dispose()`, cleanup runs
 through a private idempotent path invoked by the handle finalizer. Add

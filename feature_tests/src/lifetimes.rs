@@ -195,11 +195,9 @@ pub mod ffi {
         }
     }
 
-    #[derive(Copy, Clone)]
     #[diplomat::opaque]
     pub struct One<'a>(super::One<'a>);
 
-    #[derive(Copy, Clone)]
     #[diplomat::opaque]
     pub struct Two<'a, 'b>(super::Two<'a, 'b>);
 
@@ -258,10 +256,10 @@ pub mod ffi {
             bottom: &One<'bottom>,
         ) -> Box<One<'top>> {
             Box::new(match 0 {
-                0 => *bottom,
-                1 => *left,
-                2 => *right,
-                _ => *top,
+                0 => One(bottom.0),
+                1 => One(left.0),
+                2 => One(right.0),
+                _ => One(top.0),
             })
         }
 
@@ -275,8 +273,8 @@ pub mod ffi {
         ) -> Box<One<'left>> {
             let _ = (top, right);
             Box::new(match 0 {
-                0 => *bottom,
-                _ => *left,
+                0 => One(bottom.0),
+                _ => One(left.0),
             })
         }
 
@@ -290,8 +288,8 @@ pub mod ffi {
         ) -> Box<One<'right>> {
             let _ = (top, left);
             Box::new(match 0 {
-                0 => *bottom,
-                _ => *right,
+                0 => One(bottom.0),
+                _ => One(right.0),
             })
         }
 
@@ -304,7 +302,7 @@ pub mod ffi {
             bottom: &One<'bottom>,
         ) -> Box<One<'bottom>> {
             let _ = (top, left, right);
-            Box::new(*bottom)
+            Box::new(One(bottom.0))
         }
 
         // Holds: [a, b, c, d]
@@ -318,10 +316,10 @@ pub mod ffi {
         ) -> Box<One<'a>> {
             let _ = nohold;
             Box::new(match 0 {
-                0 => *a,
-                1 => *b,
-                2 => *c,
-                _ => *d,
+                0 => One(a.0),
+                1 => One(b.0),
+                2 => One(c.0),
+                _ => One(d.0),
             })
         }
 
@@ -335,8 +333,8 @@ pub mod ffi {
         ) -> Box<One<'a>> {
             let _ = nohold;
             Box::new(match 0 {
-                0 => *explicit_hold,
-                _ => *implicit_hold,
+                0 => One(explicit_hold.0),
+                _ => One(implicit_hold.0),
             })
         }
 
@@ -351,9 +349,9 @@ pub mod ffi {
         ) -> Box<One<'a>> {
             let _ = nohold;
             Box::new(match 0 {
-                0 => *explicit_,
-                1 => *implicit_1,
-                _ => *implicit_2,
+                0 => One(explicit_.0),
+                1 => One(implicit_1.0),
+                _ => One(implicit_2.0),
             })
         }
     }
