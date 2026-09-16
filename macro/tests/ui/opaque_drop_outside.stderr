@@ -1,0 +1,10 @@
+error[E0119]: conflicting implementations of trait `Drop` for type `Foo`
+ --> tests/ui/opaque_drop_outside.rs:1:1
+  |
+1 | #[diplomat::bridge]
+  | ^^^^^^^^^^^^^^^^^^^ conflicting implementation for `Foo`
+...
+7 | impl Drop for ffi::Foo {
+  | ---------------------- first implementation here
+  |
+  = note: this error originates in the attribute macro `diplomat::bridge` (in Nightly builds, run with -Z macro-backtrace for more info)

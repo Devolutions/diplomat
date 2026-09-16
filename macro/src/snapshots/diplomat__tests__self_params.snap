@@ -25,4 +25,8 @@ mod ffi {
     #[no_mangle]
     #[allow(deprecated)]
     extern "C" fn RefList_destroy<'a>(this: Box<RefList<'a>>) {}
+    #[allow(clippy::empty_drop)]
+    impl<'a> Drop for RefList<'a> {
+        fn drop(&mut self) {}
+    }
 }
